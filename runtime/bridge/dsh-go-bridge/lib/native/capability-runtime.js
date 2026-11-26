@@ -38,8 +38,14 @@ export class CapabilityRuntime {
   }
   revoke(e) {
     this.leases.delete(e.lease);
+    clearInterval(e.micTimer);
+    e.micTimer = undefined;
     e.controller.abort();
     e.download?.abort();
+    // The app owns the microphone: a terminal event already ended the role, so a lease that still
+    // holds `mic` here was revoked by the bridge (reload, unload, connection sweep) and the app
+    // must stop capturing. The event carries no audio, only the lease and the reason.
+    if (e.roles.has('mic') && !e.conn?.ws.closed) e.conn.send({ t: 'mic.end', lease: e.lease, reason: 'revoked' });
   }
   drop(conn) {
     for (const e of [...this.leases.values()]) if (e.conn === conn) this.revoke(e);
@@ -60,9 +66,10 @@ export class CapabilityRuntime {
     const prepared = new Set();
     const started = new Set();
     const isStart = effect => effect.type === 'audio' ? effect.op === 'play'
-      : effect.type === 'voice' ? effect.op === 'start' : effect.type === 'overlay' && effect.op === 'show';
+      : effect.type === 'voice' ? effect.op === 'start' : effect.type === 'mic' ? effect.op === 'start'
+      : effect.type === 'overlay' && effect.op === 'show';
     return effects.filter(effect => {
-      if (!['audio', 'voice', 'overlay'].includes(effect.type)) return true;
+      if (!['audio', 'voice', 'overlay', 'mic'].includes(effect.type)) return true;
       const reject = () => { issues.push({ path: '/runtime/effects', code: 'bad-effect', severity: 'warn', message: 'capability requires a live negotiated instance and resource budget' }); return false; };
       if (!conn?.helloed || conn.ws.closed || !this.alive({ pkg: rec.pkg, uid: rec.uid, stamp: rec.stamp })) return reject();
       let e = [...this.leases.values()].find(x => x.conn === conn && x.pkg === rec.pkg && x.instance === effect.instance);
@@ -93,7 +100,16 @@ export class CapabilityRuntime {
       if (!start && !e.roles.has(effect.type)) return reject();
       if (start) { e.roles.add(effect.type); started.add(roleKey); }
       if (media) { e.media = media; e.mediaToken = reg.token; e.key = effect.key; }
-      if (effect.type === 'audio' && effect.op === 'stop') { e.audioStopping = true; e.download?.abort(); }
+      if (effect.type === 'mic' && start && !e.micTimer) {
+      // The app sends; the bridge's accepted seq is the only proof that bytes left the socket.
+      // A 250 ms status lets the app keep a bounded window without faking a socket watermark.
+      e.micTimer = setInterval(() => {
+        if (!this.currentLease(e) || e.conn.ws.closed) return;
+        e.conn.send({ t: 'mic.status', lease: e.lease, seq: e.micSeq ?? 0, got: e.micGot ?? 0, dropped: e.micDropped ?? 0, pending: e.micPending ?? 0 });
+      }, L.micStatusMs);
+      e.micTimer.unref?.();
+    }
+    if (effect.type === 'audio' && effect.op === 'stop') { e.audioStopping = true; e.download?.abort(); }
       if (effect.type === 'overlay' && start) e.overlay = effect.id;
       if (effect.type === 'overlay' && effect.id !== e.overlay) return reject();
       effect.lease = e.lease;
@@ -129,8 +145,40 @@ export class CapabilityRuntime {
       ...(msg.reason === undefined ? {} : { reason: msg.reason }), signal: e.controller.signal }).catch(() => {});
     if (e.roles.size === 0) this.revoke(e);
   }
-  async media(req, res, url, pkg, id) {
-    const fail = this.fail;
+  /**
+   * v1.4 `mic`: one PCM16 frame of the lease's capture. Frames are dropped (never queued) once the
+   * per-lease budget is spent, so a slow plugin cannot grow the bridge's memory or stall the app.
+   * `seq` is the app's own frame counter; it only has to increase within the lease.
+   */
+  frame(conn, msg) {
+    const e = typeof msg.lease === 'string' ? this.leases.get(msg.lease) : undefined;
+    if (!e || e.conn !== conn || !this.currentLease(e) || !e.roles.has('mic')) return;
+    if (!Number.isSafeInteger(msg.seq) || msg.seq <= (e.micSeq ?? 0)) return;
+    // Strict base64: a lenient decode would turn junk into samples.
+    if (typeof msg.pcm !== 'string' || msg.pcm.length === 0 || msg.pcm.length > L.micFrameBytes * 2
+      || msg.pcm.length % 4 !== 0 || !/^[A-Za-z0-9+/]+={0,2}$/.test(msg.pcm)) return;
+    const handler = this.core.registration(e.pkg, 'mic', 'frames')?.def;
+    if (!handler) return;
+    const now = performance.now();
+    e.micTokens = Math.min(L.micFrameBurst, (e.micTokens ?? L.micFrameBurst) + ((now - (e.micTokenAt ?? now)) / 1000) * L.micFramesPerSecond);
+    e.micTokenAt = now;
+    if (e.micTokens < 1) { e.micDropped = (e.micDropped ?? 0) + 1; return; }
+    const frame = Buffer.from(msg.pcm, 'base64');
+    if (frame.byteLength === 0 || frame.byteLength > L.micFrameBytes) return;
+    // A plugin whose handler is still running gets no more frames: the microphone must not be
+    // able to grow the bridge's heap. Pending work is capped, not queued.
+    if ((e.micPending ?? 0) >= L.micPending) { e.micDropped = (e.micDropped ?? 0) + 1; return; }
+    e.micTokens -= 1;
+    e.micSeq = msg.seq;
+    e.micGot = (e.micGot ?? 0) + 1;
+    e.micPending = (e.micPending ?? 0) + 1;
+    // The frame is delivered as bytes plus the fixed format, never as an effect.
+    Promise.resolve(call(handler, { ...e.scope }, { frame, seq: msg.seq, rate: 16000, channels: 1, bitsPerSample: 16, signal: e.controller.signal }))
+      .catch(() => {})
+      .finally(() => { e.micPending -= 1; });
+  }
+
+  async media(req, res, url, pkg, id) {    const fail = this.fail;
     if (req.method !== 'GET') fail(405, 'method-not-allowed', 'GET only');
     if ([...url.searchParams.keys()].some(k => k !== 'lease' && k !== 'key') || url.searchParams.getAll('lease').length !== 1 || url.searchParams.getAll('key').length > 1) fail(400, 'bad-request', 'invalid media query');
     const e = this.leases.get(url.searchParams.get('lease'));
@@ -194,6 +242,7 @@ export class CapabilityRuntime {
 
   message(conn, msg) {
     if (msg.t === 'cap.event') { this.event(conn, msg); return true; }
+    if (msg.t === 'mic.frame') { this.frame(conn, msg); return true; }
     if (msg.t !== 'micro.sub' && msg.t !== 'micro.unsub') return false;
     if (typeof msg.sub !== 'string' || msg.sub.length < 1 || msg.sub.length > 32) return true;
     conn.microSubs ??= new Map();

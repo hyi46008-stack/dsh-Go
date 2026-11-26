@@ -571,6 +571,7 @@ handler 在 3 秒内返回 `{ pending, result }`（§2.2），桥接立即回：
 | `voice` | 用户开口 / 说完的事件 | App 在手机上检测；检测到开口**先在本地停掉同一实例的声音**，再通知插件 |
 | `micro` | 一条只放 `{text, progress}` 的小通道，最快 10 Hz | 插件推，App 画（面板下一行字幕，或悬浮字幕） |
 | `overlay` | 一行悬浮字幕，内容来自 `micro` 通道或静态文字 | App 画在自己的界面上（不覆盖其他 App），× 由 App 画 |
+| `mic`（v1.4） | 经过授权的 16 kHz 单声道 PCM16 音频帧，插件主动开始 / 停止 | App 采（用户授权 + 系统录音权限 + 前景），桥接只转发 |
 
 ### 11.1 声明与协商
 
@@ -669,6 +670,53 @@ App → 桥接：`micro.sub { sub, pkg, id, scope? }`、`micro.unsub { sub }`；
 | 能力事件 | 边沿 10 次 / 秒（突发 4）；终态每角色 1 次 |
 | micro | 10 Hz；`text` 240 字；数据 1 KiB；订阅每连接 8、每插件 2 |
 | 字幕文字 | 240 字 / 1 KiB |
+
+### 11.8 `mic`（v1.4，原始音频帧）
+
+给「拿到真实麦克风数据」的插件。与 `voice` 不同：`voice` 只给开口边沿事件，`mic` 给 PCM 帧。
+
+```js
+// package.json
+"capabilities": ["mic"]
+
+// 插件注册（ctx.inject(['dshGo'], …)）
+ctx.dshGo.onMic((scope, frame) => {
+  // frame: { frame: Uint8Array, seq, rate: 16000, channels: 1, bitsPerSample: 16, signal }
+})
+
+// 点按的立即结果里开始；另一处再发 stop
+return { type: 'mic', op: 'start', instance: 'capture' }
+```
+
+| 项 | 规则 |
+|---|---|
+| 效果 | `{ type: 'mic', op: 'start' \| 'stop', instance }`，只在立即结果里。格式固定 16 kHz / 单声道 / PCM16，带 `rate`/`channels`/`bitsPerSample` 一律按坏效果拒（`bad-effect`） |
+| 租约 | `start` 开租约、加 `mic` 角色；`stop` 只对已有 `mic` 角色的实例有效。App 报 `mic.stopped` / `mic.error`（终态，每角色一次） |
+| 数据 | App → 桥接：`{ t: 'mic.frame', lease, seq, pcm }`，`pcm` 为**严格 base64** 的 PCM16 小端字节；≤ 1024 B（20 ms = 640 B）；`seq` 在租约内递增，重复或倒退丢弃 |
+| 速率 | 50 帧 / 秒（突发 10）。超出**丢弃**（不排队、不等待），插件慢不会拖住 App |
+| 在途 | 同一租约最多 8 个尚未回调完的帧；插件回调不结束就不再开始新的帧，超出丢弃 |
+| 缓冲 | 四层各有硬上限（见下表），下游不消费时丢帧而不是排队：App 内部队列 8 帧、App→Dart 信用窗口 16 帧、Dart→桥接窗口 32 帧（按 `mic.status` 的 `got` 计数）、桥接→插件 8 帧 |
+| 回执 | 桥接每 250 ms 发 `mic.status { lease, seq, got, dropped, pending }`：`got` 是已收帧数，App 用它把「已发未收」限制在窗口内，不伪造 socket 水位 |
+| 收尾 | App 主动结束（`stop`、指示条停止、切后台、断流）由 App 发终态；桥接自己撤销租约（插件重载、卸载、sweep）时向 App 发 `mic.end { lease, reason }`，App 收到就关录音。终态只发一次 |
+| 并存 | 同一实例不要同时开 `voice` 和 `mic`：App 只有一个录音器，`mic start` 遇到 `voice` 在跑会回 `mic.error: busy` |
+| 隔离 | 帧只发给租约的插件；插件没声明 `mic`、租约被撤销、连接不是租约所在连接，一律不投递 |
+| 授权 | 插件首次 `start` 时 App 先问用户（与 `voice` 同一个「听你开口」授权），再走系统 `RECORD_AUDIO`；任一步拒绝就是 `mic.error: declined \| permission` |
+| 前台 | 只在 App 在屏幕上时采；切后台 / 锁屏 / 断流在本地立刻停，插件收到 `mic.stopped`（`reason: background`） |
+| 语音输入优先 | 输入框听写一开始，插件的采集先停（`mic.error: busy` 不会再起来） |
+| 可见 | 采的时候 App 自己的指示条常驻，点「停止」立刻结束；没有指示条就不开麦克风 |
+| 不落盘 | 不写文件、不进日志：帧只在内存里从 AudioRecord 到 WebSocket |
+
+缓冲与丢弃（每一层都有硬上限，下游慢就丢帧，seq 留空档）：
+
+| 层 | 上限 | 溢出时 |
+|---|---|---|
+| 采集线程 → 主线程 | 队列 8 帧（≈ 5 KiB） | 丢最旧的一帧，计 `dropped` |
+| 主线程 → Dart | 信用窗口 16 帧，Dart 每 8 帧回执一次 | 没有信用就不发 |
+| Dart → WebSocket | 已发未确认 32 帧（按 `mic.status.got`） | 本地丢弃 |
+| 桥接 → 插件 | 在途回调 8 帧 | 丢弃 |
+| 单帧 / 速率 | ≤ 1024 B；50 帧/秒、突发 10 | 丢弃 |
+
+P0 范围：只做前台采集，不做后台常驻、不做唤醒词、不做音频路由（`route`）。
 
 ---
 

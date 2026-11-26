@@ -4,9 +4,9 @@
 import { ID } from "./limits.js";
 import { chars, isPlainObject, toJson } from "./util.js";
 
-export const FEATURES = ["audio", "voice", "micro", "overlay", "files"];
+export const FEATURES = ["audio", "voice", "micro", "overlay", "files", "mic"];
 /** Capability effect types (`micro` is a data channel, not an effect). */
-export const EFFECT_FEATURES = ["audio", "voice", "overlay"];
+export const EFFECT_FEATURES = ["audio", "voice", "overlay", "mic"];
 export const PICKER_TYPES = ["pickFile", "pickImage"];
 // Policy budgets, not measured platform limits. Keep one selection small enough for a
 // phone and a remote host; account allocated upload buffers against the global budget.
@@ -20,15 +20,19 @@ export const CAP_LIMITS = Object.freeze({
   mediaBytes: 16 * 1024 * 1024, mediaMs: 30000, mediaConcurrent: 2,
   leases: 8, pluginLeases: 2, eventBurst: 4, eventsPerSecond: 10,
   microBytes: 1024, microMs: 100, microSubs: 8, pluginMicroSubs: 2, textChars: 240, perKind: 2,
+  // v1.4 `mic`: 16 kHz mono PCM16 in 20 ms frames (320 samples, 640 bytes). The app sends one
+  // text frame per sample window; the bridge drops frames over the rate instead of stalling.
+  micFrameBytes: 1024, micFramesPerSecond: 50, micFrameBurst: 10, micPending: 8, micStatusMs: 250,
 });
 export const AUDIO_TYPES = new Set(["audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4", "audio/aac"]);
 export const CAP_EVENTS = Object.freeze({
   "audio.ended": "audio", "audio.stopped": "audio", "audio.error": "audio",
   "voice.speechStart": "voice", "voice.speechEnd": "voice", "voice.stopped": "voice", "voice.error": "voice",
   "overlay.closed": "overlay",
+  "mic.stopped": "mic", "mic.error": "mic",
 });
 /** Events that end their role (each role ends at most once per lease). */
-export const TERMINAL_EVENTS = new Set(["audio.ended", "audio.stopped", "audio.error", "voice.stopped", "voice.error", "overlay.closed"]);
+export const TERMINAL_EVENTS = new Set(["audio.ended", "audio.stopped", "audio.error", "voice.stopped", "voice.error", "overlay.closed", "mic.stopped", "mic.error"]);
 export const featuresOf = (value) => (Array.isArray(value) ? FEATURES.filter((x) => value.includes(x)) : []);
 export const KEY = /^[A-Za-z0-9_-]{1,128}$/;
 const FEATURE_OF = { media: "audio", micro: "micro", overlays: "overlay" };
@@ -148,6 +152,10 @@ export function capabilityEffect(e, opts) {
     } else if (e.src !== undefined || e.key !== undefined) return bad(`audio ${e.op} takes no src or key`);
   } else if (e.type === "voice") {
     if (!["start", "stop"].includes(e.op)) return bad("voice op must be start or stop");
+  } else if (e.type === "mic") {
+    // Fixed format in v1.4: 16 kHz, mono, PCM16. Anything else is a different capability.
+    if (!["start", "stop"].includes(e.op)) return bad("mic op must be start or stop");
+    if (e.rate !== undefined || e.channels !== undefined || e.bitsPerSample !== undefined) return bad("mic format is fixed: 16000 Hz, mono, 16 bit");
   } else {
     if (!["show", "hide"].includes(e.op)) return bad("overlay op must be show or hide");
     if (!(p.overlays ?? []).includes(e.id)) return bad("overlay id must be one of this plugin's overlays");

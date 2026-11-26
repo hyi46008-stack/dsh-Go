@@ -18,7 +18,7 @@ const TRACKER = Symbol.for("cordis.tracker");
 const SCAN_MAX_AGE_MS = 2000;
 const CHANGED_DEBOUNCE_MS = 300;
 const SELF = "dsh-go-bridge";
-const REG_NAMES = { panels: "panel", strips: "strip", notes: "turnNote", handlers: "on", media: "media", micro: "micro", capability: "onCapability" };
+const REG_NAMES = { panels: "panel", strips: "strip", notes: "turnNote", handlers: "on", media: "media", micro: "micro", capability: "onCapability", mic: "onMic" };
 
 /** Loader entry owning a fiber (walks up through `ctx.inject` sub-fibers). */
 export function entryOf(fiber) {
@@ -389,7 +389,7 @@ export class NativeCore {
   #add(pkg, kind, id, def, token) {
     let regs = this.regs.get(pkg);
     if (regs === undefined) {
-      regs = { panels: new Map(), strips: new Map(), notes: new Map(), handlers: new Map(), media: new Map(), micro: new Map(), capability: new Map() };
+      regs = { panels: new Map(), strips: new Map(), notes: new Map(), handlers: new Map(), media: new Map(), micro: new Map(), capability: new Map(), mic: new Map() };
       this.regs.set(pkg, regs);
     }
     const count = Object.values(regs).reduce((n, entries) => n + entries.size, 0);
@@ -400,11 +400,14 @@ export class NativeCore {
     const rec = this.plugin(pkg);
     const declared = rec?.parsed.ids.get(id);
     const ok = kind === "capability" ? (rec?.parsed.capabilities?.length ?? 0) > 0
+      : kind === "mic" ? (rec?.parsed.capabilities ?? []).includes("mic")
       : kind === "media" || kind === "micro" ? declared === kind
       : kind === "handlers" ? declared !== undefined
       : kind === "panels" ? declared === "panels" : kind === "notes" ? declared === "turn.note" : declared === "composer.strip";
     if (!ok) {
-      const what = kind === "capability" ? "onCapability() needs dshGo.capabilities" : `${REG_NAMES[kind]}("${id}") is not declared in dshGo.contributes`;
+      const what = kind === "capability" ? "onCapability() needs dshGo.capabilities"
+        : kind === "mic" ? "onMic() needs the mic capability"
+        : `${REG_NAMES[kind]}("${id}") is not declared in dshGo.contributes`;
       this.runtimeIssue(pkg, `undeclared:${kind}:${id}`, { path: `/runtime/${id}`, code: "undeclared", severity: "warn", message: `${what}; ignored` });
     }
     this.regsVersion++;
@@ -445,6 +448,7 @@ export class NativeCore {
       media(id, handler) { return core.#register(this?.ctx, "media", id, handler); },
       micro(id, def) { return core.#register(this?.ctx, "micro", id, def); },
       onCapability(handler) { return core.#register(this?.ctx, "capability", "events", handler); },
+      onMic(handler) { return core.#register(this?.ctx, "mic", "frames", handler); },
       on(id, handler) { return core.#register(this?.ctx, "handlers", id, handler); },
       refresh(id, scope) { core.#refresh(this?.ctx, id, scope); },
       readPickedFile(handle) {

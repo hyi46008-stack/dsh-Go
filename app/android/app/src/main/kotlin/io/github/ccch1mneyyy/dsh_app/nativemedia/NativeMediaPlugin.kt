@@ -60,6 +60,15 @@ class NativeMediaPlugin :
 
     private var player: ClipPlayer? = null
     private var capture: VoiceCapture? = null
+    // v1.4 `mic`: the same capture, without a gate, its frames going to Dart.
+    private var micActive = false
+    @Volatile private var micSeq = 0
+    // Bounded hand-off capture → main thread; then a credit window limits what Dart has not
+    // acknowledged, so a stalled consumer stops the producer instead of growing a buffer.
+    private val micQueue = MicQueue(MIC_QUEUE)
+    private var micCredits = 0
+    // The one VoiceCapture instance serves one mode: speech gates or PCM frames.
+    private var framesMode = false
     private val overlays = MediaOverlays(onStop = { revoke("user") }, onCaptionClosed = { emitCurrent("overlay.closed", "user") })
     private val micHolder = MicArbiter.Holder { revoke("dictation") }
 
@@ -137,7 +146,7 @@ class NativeMediaPlugin :
     override fun onMethodCall(call: MethodCall, result: MethodChannel.Result) {
         if (call.method == "capabilities") {
             val mic = appContext.packageManager.hasSystemFeature(PackageManager.FEATURE_MICROPHONE)
-            result.success(mapOf("features" to listOfNotNull("audio", "overlay", if (mic) "voice" else null)))
+            result.success(mapOf("features" to listOfNotNull("audio", "overlay", if (mic) "voice" else null, if (mic) "mic" else null)))
             return
         }
         if (call.method == "activate") return activate(call, result)
@@ -171,6 +180,14 @@ class NativeMediaPlugin :
             "requestVoiceGrant" -> requestGrant(o, result)
             "startVoice" -> startVoice(o, result)
             "stopVoice" -> ok(result, stopVoice(), "close")
+            "startMic" -> startMic(o, result)
+            "micAck" -> {
+                val count = call.argument<Int>("count") ?: 0
+                micCredits = minOf(MIC_WINDOW, micCredits + count.coerceIn(0, MIC_WINDOW))
+                result.success(null)
+            }
+            // The terminal event is Dart's: it reports mic.stopped after this call closes the recorder.
+            "stopMic" -> ok(result, stopVoice(), "close")
             "showOverlay" -> showOverlay(call, result, update = false)
             "updateOverlay" -> showOverlay(call, result, update = true)
             "hideOverlay" -> {
@@ -261,16 +278,24 @@ class NativeMediaPlugin :
     }
 
     private fun startVoice(o: Owner, result: MethodChannel.Result) {
+        micActive = false
         if (!onScreen()) return result.error("not-foreground", "the app is not on screen", null)
         if (!hasMicPermission()) return result.error("permission", "RECORD_AUDIO is not granted", null)
-        if (capture?.active == true) return result.success(null)
+        // A plugin's frame capture gives way to its own listening, and vice versa.
+        if (capture?.active == true && !framesMode) return result.success(null)
+        if (framesMode) capture?.stop()
         if (!MicArbiter.acquire(micHolder)) return result.error("busy", "dictation is using the microphone", null)
         // The indicator first: no listening without it.
         if (!overlays.showIndicator(o.pluginTitle)) {
             MicArbiter.release(micHolder)
             return result.error("indicator", "nothing to show the indicator in", null)
         }
-        val c = capture ?: VoiceCapture(main, ::onSpeechEdge, ::onCaptureError).also { capture = it }
+        val c = voiceCapture(frames = false)
+        if (c == null) {
+            overlays.hideIndicator()
+            MicArbiter.release(micHolder)
+            return result.error("stopping", "the previous capture is still closing", null)
+        }
         if (!c.start()) {
             overlays.hideIndicator()
             MicArbiter.release(micHolder)
@@ -281,8 +306,55 @@ class NativeMediaPlugin :
         result.success(null)
     }
 
+    /** v1.4: PCM capture for one plugin lease — the indicator is the visible proof it runs. */
+    private fun startMic(o: Owner, result: MethodChannel.Result) {
+        if (!onScreen()) return result.error("not-foreground", "the app is not on screen", null)
+        if (!hasMicPermission()) return result.error("permission", "RECORD_AUDIO is not granted", null)
+        if (micActive) return result.success(null)
+        if (!MicArbiter.acquire(micHolder)) return result.error("busy", "dictation is using the microphone", null)
+        if (!overlays.showIndicator(o.pluginTitle)) {
+            MicArbiter.release(micHolder)
+            return result.error("indicator", "nothing to show the indicator in", null)
+        }
+        // The voice listener, if any, ends before the frames start.
+        val c = voiceCapture(frames = true)
+        if (c == null) {
+            overlays.hideIndicator()
+            MicArbiter.release(micHolder)
+            return result.error("stopping", "the previous capture is still closing", null)
+        }
+        if (!c.start()) {
+            overlays.hideIndicator()
+            MicArbiter.release(micHolder)
+            return result.error("capture", "the microphone could not be opened", null)
+        }
+        micActive = true
+        micSeq = 0
+        micQueue.clear()
+        micCredits = MIC_WINDOW
+        main.postDelayed(micPump, MIC_FRAME_MS)
+        Log.i(TAG, "mic: 16 kHz mono PCM16 frames, echo canceller ${if (c.echoCancelled) "on" else "unavailable"}")
+        result.success(null)
+    }
+
+    /**
+     * One recorder, one mode: recreated when the mode changes, never shared. Null when the previous
+     * thread has not exited yet — opening a second recorder over it is exactly what must not happen.
+     */
+    private fun voiceCapture(frames: Boolean): VoiceCapture? {
+        val current = capture
+        if (current != null && framesMode == frames) return current
+        if (current != null && !current.stop()) return null
+        return (if (frames) VoiceCapture(main, ::onSpeechEdge, ::onCaptureError, ::onMicFrame)
+        else VoiceCapture(main, ::onSpeechEdge, ::onCaptureError)).also { capture = it; framesMode = frames }
+    }
+
     /** Stops listening; the indicator goes only once the microphone is closed. */
     private fun stopVoice(): Boolean {
+        micActive = false
+        micQueue.clear()
+        micCredits = 0
+        main.removeCallbacks(micPump)
         val closed = capture?.stop() != false
         MicArbiter.release(micHolder)
         overlays.hideIndicator()
@@ -312,10 +384,47 @@ class NativeMediaPlugin :
         }
     }
 
+    /** Capture thread: hand the frame to a bounded queue; never block, never allocate a task. */
+    private fun onMicFrame(frame: ShortArray, count: Int) {
+        if (!micActive) return
+        micQueue.offer(MicQueue.Frame(++micSeq, MicPcm.bytes(frame, count)))
+    }
+
+    /** Main thread: send at most [MIC_PER_TICK] frames per tick while the credit window allows. */
+    private val micPump = object : Runnable {
+        override fun run() {
+            if (!micActive) return
+            val o = owner
+            val s = sink
+            if (o == null || s == null) {
+                micQueue.clear()
+            } else {
+                var sent = 0
+                while (sent < MIC_PER_TICK && micCredits > 0) {
+                    val frame = micQueue.take() ?: break
+                    micCredits--
+                    s.success(
+                        buildMap {
+                            put("owner", o.token)
+                            put("generation", o.generation)
+                            put("lease", o.lease)
+                            put("kind", "mic.frame")
+                            put("seq", frame.seq)
+                            put("bytes", frame.bytes)
+                        },
+                    )
+                    sent++
+                }
+            }
+            main.postDelayed(this, MIC_FRAME_MS)
+        }
+    }
+
     private fun onCaptureError(reason: String) {
         if (owner == null) return
+        val wasMic = micActive
         stopVoice()
-        emitCurrent("voice.error", reason)
+        emitCurrent(if (wasMic) "mic.error" else "voice.error", reason)
     }
 
     // ---- caption -------------------------------------------------------------------------------
@@ -386,6 +495,11 @@ class NativeMediaPlugin :
     private companion object {
         const val TAG = "DshMedia"
         const val REQUEST_CODE = 0x4E4D
+        // Frames waiting for the main thread, and frames Dart has not acknowledged.
+        const val MIC_QUEUE = 8
+        const val MIC_WINDOW = 16
+        const val MIC_PER_TICK = 4
+        const val MIC_FRAME_MS = 20L
         const val MAX_TITLE = 24
         const val MAX_CAPTION_CHARS = 240
         const val MAX_CAPTION_BYTES = 1024

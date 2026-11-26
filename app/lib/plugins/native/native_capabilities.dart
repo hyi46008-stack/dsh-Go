@@ -14,6 +14,7 @@
 import 'dart:async';
 import 'dart:io';
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:dsh_client/dsh_client.dart';
 import 'package:flutter/services.dart' show PlatformException;
@@ -30,13 +31,13 @@ import 'native_platform.dart';
 import 'native_file_platform.dart';
 import 'native_state.dart';
 
-/// An `audio` / `voice` / `overlay` effect from an invoke answer, with the
-/// lease the bridge added.
+/// An `audio` / `voice` / `overlay` / `mic` effect from an invoke answer, with
+/// the lease the bridge added.
 @immutable
 class NativeCapabilityEffect {
   const NativeCapabilityEffect(this.type, this.op, this.instance, this.lease, {this.resource, this.key});
 
-  /// `audio`, `voice`, `overlay`.
+  /// `audio`, `voice`, `overlay`, `mic`.
   final String type;
   final String op;
   final String instance;
@@ -48,7 +49,7 @@ class NativeCapabilityEffect {
 
   bool get starts => op == 'play' || op == 'start' || op == 'show';
 
-  static bool isType(Object? value) => const {'audio', 'voice', 'overlay'}.contains(value);
+  static bool isType(Object? value) => const {'audio', 'voice', 'overlay', 'mic'}.contains(value);
 
   static final _key = RegExp(r'^[A-Za-z0-9_-]{1,128}$');
 
@@ -69,6 +70,7 @@ class NativeCapabilityEffect {
       'audio' => const {'play', 'pause', 'resume', 'stop'},
       'voice' => const {'start', 'stop'},
       'overlay' => const {'show', 'hide'},
+      'mic' => const {'start', 'stop'},
       _ => const <String>{},
     };
     if (!ops.contains(op)) return null;
@@ -133,7 +135,11 @@ Future<(File, String)> downloadNativeMedia(
 /// back on).
 typedef NativeVoiceConsent = Future<bool> Function(String package);
 
-const _terminals = {'audio.ended', 'audio.stopped', 'audio.error', 'voice.stopped', 'voice.error', 'overlay.closed'};
+/// Frames the app will hand to the socket before the bridge's status catches up (≈ 32 KiB).
+const _micWindow = 32;
+const _micAckEvery = 8;
+
+const _terminals = {'audio.ended', 'audio.stopped', 'audio.error', 'voice.stopped', 'voice.error', 'overlay.closed', 'mic.stopped', 'mic.error'};
 
 class _Owner {
   _Owner(this.token, this.generation, this.pkg, this.instance, this.lease, this.scope, this.conn);
@@ -157,6 +163,10 @@ class _Owner {
   /// `cap.event`s not sent yet (at most 4, one every 100 ms).
   final events = <(String, String?)>[];
   int seq = 0;
+
+  /// v1.4 `mic`: frames handed to the socket, and the last count the bridge acknowledged.
+  /// The difference is the app-side send window; the bridge's status keeps it bounded.
+  int micSent = 0, micGot = 0, micDropped = 0, micAcks = 0;
 
   /// Bumped by stop / speech: a download that finishes later must not play.
   int audioGeneration = 0;
@@ -187,6 +197,8 @@ class NativeCapabilityRuntime {
       if (link != DshGoLink.open) unawaited(revoke());
     });
     _events = platform.events.listen(_event, onError: (Object _) => unawaited(revoke()));
+    _micEnds = stream.micEnds.listen(_micEnd);
+    _micStats = stream.micStats.listen(_micStatus);
   }
 
   final NativeMediaPlatform platform;
@@ -202,6 +214,8 @@ class NativeCapabilityRuntime {
   final void Function()? onNativeFailure;
   late final StreamSubscription<DshGoLink> _links;
   late final StreamSubscription<Object?> _events;
+  late final StreamSubscription<DshGoMicEnd> _micEnds;
+  late final StreamSubscription<DshGoMicStatus> _micStats;
   _Owner? _owner;
   int _generation = 0;
   bool _foreground, _disposed = false, _nativeFailed = false;
@@ -359,6 +373,48 @@ class NativeCapabilityRuntime {
             await platform.call('stopVoice', o.args);
             if (_current(o)) _terminal(o, 'voice.stopped');
           }
+        case 'mic':
+          if (effect.op == 'start') {
+            if (o.denied || o.roles.contains('mic') || o.ended.contains('mic')) return false;
+            // One recorder: a running `voice` listener and `mic` frames cannot share it.
+            if (o.roles.contains('voice')) {
+              o.ended.add('mic');
+              _queue(o, 'mic.error', 'busy');
+              return false;
+            }
+            final allowed = consent == null ? false : await consent(pkg);
+            if (!_current(o)) return false;
+            if (!allowed) {
+              // The app's own consent comes first; without it nothing opens.
+              o.denied = true;
+              o.ended.add('mic');
+              _queue(o, 'mic.error', 'declined');
+              return false;
+            }
+            final granted = await platform.call('requestVoiceGrant', o.args);
+            if (!_current(o)) return false;
+            if (granted != true) {
+              o.denied = true;
+              o.ended.add('mic');
+              _queue(o, 'mic.error', 'permission');
+              return false;
+            }
+            o.granted = true;
+            o.roles.add('mic');
+            try {
+              await platform.call('startMic', o.args);
+            } on PlatformException catch (e) {
+              if (_current(o)) {
+                _terminal(o, 'mic.error', const {'busy', 'permission', 'capture', 'indicator'}.contains(e.code) ? e.code : 'error');
+              }
+              return false;
+            }
+            if (!_current(o)) return false;
+          } else {
+            if (!o.roles.contains('mic')) return false;
+            await platform.call('stopMic', o.args);
+            if (_current(o)) _terminal(o, 'mic.stopped');
+          }
         case 'overlay':
           if (effect.op == 'show') {
             if (o.roles.contains('overlay') || o.ended.contains('overlay')) return false;
@@ -451,6 +507,28 @@ class NativeCapabilityRuntime {
       unawaited(_revokeOwner(o));
       return;
     }
+    if (kind == 'mic.frame') {
+      // One authorized frame straight to the bridge; never held, never stored. Two bounds keep
+      // a stalled consumer from growing memory: the bridge counts what it accepted (status), and
+      // Dart stops feeding beyond a fixed window. Dropped frames show up as seq gaps.
+      final bytes = value['bytes'];
+      final seq = value['seq'];
+      if (!o.roles.contains('mic') || bytes is! Uint8List || seq is! int) return;
+      if (o.micSent - o.micGot >= _micWindow) {
+        o.micDropped++;
+        return;
+      }
+      if (!stream.micFrame(o.lease, seq, bytes)) return;
+      o.micSent++;
+      // Credit back to the native side in batches: it stops sending when the window empties.
+      if (++o.micAcks >= _micAckEvery) {
+        o.micAcks = 0;
+        unawaited(
+          platform.call('micAck', {...o.args, 'count': _micAckEvery}).then<void>((_) {}, onError: (Object _) {}),
+        );
+      }
+      return;
+    }
     if (kind == 'voice.speechStart') {
       // Only with proof that this owner's playback is already stopped.
       if (!o.granted || !o.roles.contains('voice') || o.speaking || value['localStopped'] != true) return;
@@ -492,13 +570,32 @@ class NativeCapabilityRuntime {
 
   Future<void> _stopRole(_Owner o, String role, String reason) async {
     if (!o.roles.contains(role) || !o.stopping.add(role)) return;
+    final (method, terminal) = switch (role) {
+      'voice' => ('stopVoice', 'voice.stopped'),
+      'mic' => ('stopMic', 'mic.stopped'),
+      _ => ('hideOverlay', 'overlay.closed'),
+    };
     try {
-      await platform.call(role == 'voice' ? 'stopVoice' : 'hideOverlay', o.args);
+      await platform.call(method, o.args);
     } catch (_) {
       await _revokeOwner(o);
       return;
     }
-    if (_current(o)) _terminal(o, role == 'voice' ? 'voice.stopped' : 'overlay.closed', reason);
+    if (_current(o)) _terminal(o, terminal, reason);
+  }
+
+  /// The bridge's accept counter, four times a second: proof of how much actually left the socket.
+  void _micStatus(DshGoMicStatus event) {
+    final o = _owner;
+    if (o == null || o.lease != event.lease || !o.roles.contains('mic')) return;
+    o.micGot = event.got;
+  }
+
+  /// The bridge revoked a `mic` lease (plugin reload, unload): close the recorder here too.
+  void _micEnd(DshGoMicEnd event) {
+    final o = _owner;
+    if (o == null || o.lease != event.lease || !o.roles.contains('mic')) return;
+    unawaited(_stopRole(o, 'mic', event.reason));
   }
 
   void _queue(_Owner o, String event, [String? reason]) {
@@ -579,6 +676,8 @@ class NativeCapabilityRuntime {
     await revoke();
     await _links.cancel();
     await _events.cancel();
+    await _micEnds.cancel();
+    await _micStats.cancel();
   }
 }
 
@@ -611,7 +710,7 @@ final nativeCapabilityDiscoveryProvider = FutureProvider.autoDispose<void>((ref)
       .where((p) => p.native)
       .expand((p) => p.capabilities)
       .toSet();
-  final media = declarations.any({'audio', 'voice', 'micro', 'overlay'}.contains);
+  final media = declarations.any({'audio', 'voice', 'micro', 'overlay', 'mic'}.contains);
   final bridge = ref.watch(nativeBridgeProvider);
   // Establish both dependencies before awaiting: a host switch can dispose this
   // discovery while either platform probe is still pending.

@@ -23,8 +23,10 @@ object MicArbiter {
     fun beginDictation(): Int {
         val holder = plugin
         plugin = null
-        holder?.yieldMic()
+        // Claim first: yieldMic() runs the plugin's stop, which must not be able to re-acquire
+        // the microphone between the stop and the dictation.
         dictating = true
+        holder?.yieldMic()
         return (++dictation).also { unfinished += it }
     }
 

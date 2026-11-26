@@ -80,7 +80,7 @@ export function createTestHost(options = {}) {
   const logs = []
   const pending = []
   const runtimeIssues = new Map()
-  const regs = { panels: new Map(), strips: new Map(), notes: new Map(), handlers: new Map(), media: new Map(), micro: new Map(), capability: new Map() }
+  const regs = { panels: new Map(), strips: new Map(), notes: new Map(), handlers: new Map(), media: new Map(), micro: new Map(), capability: new Map(), mic: new Map() }
   const feeds = new Set()
   const violations = []
 
@@ -157,6 +157,16 @@ export function createTestHost(options = {}) {
       if (typeof handler !== 'function') throw new TypeError('invalid capability handler')
       regs.capability.set('events', handler)
       return () => regs.capability.delete('events')
+    },
+    onMic(handler) {
+      if (typeof handler !== 'function') throw new TypeError('invalid mic handler')
+      // Fail closed, as the bridge never opens a mic lease without the declaration.
+      if (!(parsed.capabilities ?? []).includes('mic')) {
+        runtimeIssues.set('undeclared:mic', { path: '/runtime/mic', code: 'undeclared', severity: 'warn', message: 'onMic() needs the mic capability; ignored' })
+        return () => {}
+      }
+      regs.mic.set('frames', handler)
+      return () => regs.mic.delete('frames')
     },
     on(id, handler) {
       if (typeof id !== 'string' || !ID.test(id)) throw new TypeError(`dshGo.handlers: id must match ${ID}`)
@@ -378,6 +388,10 @@ export function createTestHost(options = {}) {
       }).catch(failed)
       feeds.add(feed)
       return feed
+    },
+    /** Pushes one frame as an authorized capture would; the lease lifecycle is the bridge's. */
+    async micFrame(scope, frame) {
+      await regs.mic.get('frames')?.({ ...scope }, { signal: new AbortController().signal, ...frame })
     },
     async capabilityEvent(scope, event) {
       // Explicit test injection only; callback returns never become effects.

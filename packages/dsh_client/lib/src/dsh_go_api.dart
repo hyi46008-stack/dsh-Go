@@ -1027,6 +1027,8 @@ const dshGoCapabilityEvents = {
   'voice.stopped',
   'voice.error',
   'overlay.closed',
+  'mic.stopped',
+  'mic.error',
 };
 
 final _dshGoId = RegExp(r'^[A-Za-z0-9][A-Za-z0-9_.-]{0,39}$');
@@ -1160,6 +1162,32 @@ class DshGoChanged {
   const DshGoChanged();
 }
 
+/// The bridge ended a `mic` lease the app did not end itself (plugin reload, unload, sweep):
+/// the app must close its recorder. No audio, no scope.
+class DshGoMicEnd {
+  const DshGoMicEnd(this.lease, this.reason);
+  final String lease;
+  final String reason;
+}
+
+/// What the bridge last accepted for a `mic` lease: the app's send window is bounded by it.
+class DshGoMicStatus {
+  const DshGoMicStatus(this.lease, this.seq, this.got, this.dropped, this.pending);
+  final String lease;
+
+  /// Highest frame seq the bridge took.
+  final int seq;
+
+  /// Total frames the bridge accepted for this lease; the app's window is sent minus got.
+  final int got;
+
+  /// Frames the bridge dropped (rate or pending cap).
+  final int dropped;
+
+  /// Plugin callbacks still running in the bridge.
+  final int pending;
+}
+
 class _Subscription {
   _Subscription(this.sid, this.pkg, this.id, this.scope, this.controller, {this.data, this.rev});
 
@@ -1225,6 +1253,8 @@ class DshGoStream {
   final _subs = <String, _Subscription>{};
   final _microSubs = <String, _MicroSubscription>{};
   final _changes = StreamController<DshGoChanged>.broadcast();
+  final _micEnds = StreamController<DshGoMicEnd>.broadcast();
+  final _micStats = StreamController<DshGoMicStatus>.broadcast();
   final _links = StreamController<DshGoLink>.broadcast();
   DshGoSocket? _socket;
   StreamSubscription<Object?>? _socketSub;
@@ -1262,6 +1292,12 @@ class DshGoStream {
 
   /// Contributions changed on the Host (`changed`).
   Stream<DshGoChanged> get changes => _changes.stream;
+
+  /// v1.4: leases the bridge revoked on its own; a listener stops the matching capture.
+  Stream<DshGoMicEnd> get micEnds => _micEnds.stream;
+
+  /// v1.4: what the bridge has accepted so far, four times a second while a mic lease is open.
+  Stream<DshGoMicStatus> get micStats => _micStats.stream;
 
   int get subscriptionCount => _subs.length;
 
@@ -1386,6 +1422,25 @@ class DshGoStream {
     }
     final short = reason == null ? null : String.fromCharCodes(reason.runes.take(120));
     _send({'t': 'cap.event', 'lease': lease, 'seq': seq, 'event': event, 'reason': ?short});
+    return true;
+  }
+
+  /// v1.4: one PCM16 frame of an authorized `mic` capture (16 kHz, mono, 20 ms
+  /// at most). False when there is no socket, the lease's capability was not
+  /// negotiated, or the frame is not a plausible single frame.
+  bool micFrame(String lease, int seq, Uint8List pcm) {
+    if (_link != DshGoLink.open ||
+        conn == null ||
+        lease.isEmpty ||
+        lease.length > 256 ||
+        seq < 1 ||
+        pcm.isEmpty ||
+        pcm.length > 1024 ||
+        pcm.length.isOdd ||
+        !negotiatedFeatures.contains('mic')) {
+      return false;
+    }
+    _send({'t': 'mic.frame', 'lease': lease, 'seq': seq, 'pcm': base64Encode(pcm)});
     return true;
   }
 
@@ -1541,6 +1596,8 @@ class DshGoStream {
       await sub.controller.close();
     }
     await _changes.close();
+    await _micEnds.close();
+    await _micStats.close();
     await _links.close();
   }
 
@@ -1711,6 +1768,21 @@ class DshGoStream {
         return;
       case 'micro.data' || 'micro.end':
         _onMicro(map, utf8.encode(raw).length);
+        return;
+      case 'mic.status':
+        if (!_micStats.isClosed) {
+          final lease = asString(map['lease']);
+          final seq = map['seq'];
+          if (lease != null && lease.isNotEmpty && seq is int) {
+            _micStats.add(DshGoMicStatus(lease, seq, map['got'] is int ? map['got'] as int : 0, map['dropped'] is int ? map['dropped'] as int : 0, map['pending'] is int ? map['pending'] as int : 0));
+          }
+        }
+        return;
+      case 'mic.end':
+        if (!_micEnds.isClosed) {
+          final lease = asString(map['lease']);
+          if (lease != null && lease.isNotEmpty) _micEnds.add(DshGoMicEnd(lease, asString(map['reason']) ?? 'revoked'));
+        }
         return;
       case 'data' || 'patch' || 'sync' || 'stale' || 'end':
         break;

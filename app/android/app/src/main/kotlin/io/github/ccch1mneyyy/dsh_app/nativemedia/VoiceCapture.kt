@@ -15,13 +15,19 @@ import android.os.SystemClock
  * [AcousticEchoCanceler] on when the device has one, through a [SpeechGate]. Frames are measured
  * and dropped on the capture thread; only the gate's edges reach the main thread.
  *
- * [stop] ends the capture before it returns (it waits briefly for the thread), so the microphone
- * is free for dictation right after.
+ * v1.4 `mic`: with [onFrame] set, the same recorder hands every 20 ms frame to that callback and
+ * no gate runs.
+ *
+ * Lifecycle: the capture thread owns closing. [stop] only signals and waits; it never releases an
+ * [AudioRecord] the thread may still be reading. The thread's `finally` stops and releases the
+ * recorder and the echo canceller, and clears `running`, so "join timed out" can never mean
+ * "released under a running thread". [start] refuses while the previous thread is alive.
  */
 class VoiceCapture(
     private val main: Handler,
     private val onEdge: (SpeechGate.Edge) -> Unit,
     private val onError: (String) -> Unit,
+    private val onFrame: ((ShortArray, Int) -> Unit)? = null,
 ) {
     private var record: AudioRecord? = null
     private var aec: AcousticEchoCanceler? = null
@@ -36,11 +42,23 @@ class VoiceCapture(
     var echoCancelled = false
         private set
 
-    val active get() = record != null
+    /** A recorder is open and its thread is running. */
+    val active get() = running && record != null
+
+    /** A stopped capture whose thread has not exited yet; starting again would be a second read. */
+    val closing get() = thread?.isAlive == true
 
     @SuppressLint("MissingPermission") // NativeMediaPlugin checks RECORD_AUDIO first.
     fun start(): Boolean {
-        stop()
+        // One recorder, one thread. Never open a second one over a thread that is still exiting.
+        if (thread?.isAlive == true) return false
+        // A previous capture that ended on its own left its recorder behind: close it here.
+        record?.let { runCatching { it.stop() }; runCatching { it.release() } }
+        record = null
+        runCatching { aec?.release() }
+        aec = null
+        gate = null
+
         val min = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         if (min <= 0) return false
         val r = runCatching {
@@ -57,25 +75,28 @@ class VoiceCapture(
             return false
         }
         echoCancelled = false
-        if (runCatching { AcousticEchoCanceler.isAvailable() }.getOrDefault(false)) {
-            aec = runCatching { AcousticEchoCanceler.create(r.audioSessionId) }.getOrNull()?.also { effect ->
-                echoCancelled = runCatching { effect.setEnabled(true) == AudioEffect.SUCCESS && effect.enabled }.getOrDefault(false)
+        val effect = if (runCatching { AcousticEchoCanceler.isAvailable() }.getOrDefault(false)) {
+            runCatching { AcousticEchoCanceler.create(r.audioSessionId) }.getOrNull()?.also { e ->
+                echoCancelled = runCatching { e.setEnabled(true) == AudioEffect.SUCCESS && e.enabled }.getOrDefault(false)
             }
-        }
+        } else null
         val started = runCatching { r.startRecording() }.isSuccess && r.recordingState == AudioRecord.RECORDSTATE_RECORDING
         if (!started) {
-            runCatching { aec?.release() }
-            aec = null
+            runCatching { effect?.release() }
             r.release()
             return false
         }
         record = r
+        aec = effect
         // 快's 700 ms: what voice input always had (the call's pause is its own setting).
-        val g = SpeechGate(echoCancelled, TurnPause.QUICK).also { gate = it }
-        if (playing) g.setPlaying(true, SystemClock.elapsedRealtime())
+        val tap = onFrame
+        val g = if (tap == null) SpeechGate(echoCancelled, TurnPause.QUICK).also { gate = it } else null
+        if (playing) g?.setPlaying(true, SystemClock.elapsedRealtime())
         running = true
         val mine = ++session
-        thread = Thread({ capture(r, g, mine) }, "dsh-plugin-voice").also { it.start() }
+        val t = Thread({ captureLoop(r, effect, g, mine) }, "dsh-plugin-voice")
+        thread = t
+        t.start()
         return true
     }
 
@@ -86,7 +107,7 @@ class VoiceCapture(
         synchronized(g) { g.setPlaying(on, SystemClock.elapsedRealtime()) }
     }
 
-    private fun capture(r: AudioRecord, g: SpeechGate, mine: Int) {
+    private fun captureLoop(r: AudioRecord, effect: AcousticEchoCanceler?, g: SpeechGate?, mine: Int) {
         val frame = ShortArray((RATE * SpeechGate.FRAME_MS / 1000).toInt())
         var filled = 0
         try {
@@ -100,14 +121,27 @@ class VoiceCapture(
                 filled += n
                 if (filled < frame.size) continue
                 filled = 0
+                val tap = onFrame
+                if (tap != null) {
+                    tap(frame, frame.size)
+                    continue
+                }
                 val level = SpeechGate.levelOf(frame, frame.size)
-                val edge = synchronized(g) { g.consume(level, SystemClock.elapsedRealtime()) }
+                val edge = synchronized(g!!) { g.consume(level, SystemClock.elapsedRealtime()) }
                 if (edge != SpeechGate.Edge.NONE) post(mine) { onEdge(edge) }
             }
         } catch (_: RuntimeException) {
             post(mine) { onError("capture") }
         } finally {
+            // The thread closes: stop() may have timed out, and releasing here is the only point
+            // where no read can be in flight on this recorder.
+            running = false
+            runCatching { r.stop() }
+            runCatching { effect?.release() }
+            runCatching { r.release() }
             frame.fill(0)
+            // A newer capture (different session) owns the fields now; this one must not clear them.
+            main.post { if (mine == session) { record = null; aec = null; gate = null } }
         }
     }
 
@@ -115,22 +149,25 @@ class VoiceCapture(
         main.post { if (mine == session && running) block() }
     }
 
-    /** Ends the capture: the thread leaves its read, the recorder and effect are released. */
+    /**
+     * Ends the capture and reports whether the thread really exited. False means "still closing":
+     * the recorder and the echo canceller stay owned by the thread until it leaves, and [start]
+     * refuses until then.
+     */
     fun stop(): Boolean {
-        session++
         running = false
-        val r = record ?: return true
-        record = null
-        gate = null
-        runCatching { r.stop() }
+        val r = record
+        runCatching { r?.stop() }
         val t = thread
-        thread = null
-        runCatching { t?.join(JOIN_MS) }
-        val ended = t?.isAlive != true
-        runCatching { aec?.release() }
-        aec = null
-        runCatching { r.release() }
-        return ended
+        if (t != null) runCatching { t.join(JOIN_MS) }
+        val exited = t?.isAlive != true
+        if (exited) {
+            record = null
+            aec = null
+            gate = null
+            thread = null
+        }
+        return exited
     }
 
     private companion object {
