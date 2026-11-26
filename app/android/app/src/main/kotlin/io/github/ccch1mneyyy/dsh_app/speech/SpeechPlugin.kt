@@ -49,7 +49,7 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandl
     private var focus: AudioFocusRequest? = null
 
     private var capture: CallCapture? = null
-    private var mic = 0
+    private var mic: Int? = null
     private var previousMode: Int? = null
     private var speaker = true
     private var externalPlaying = false
@@ -225,7 +225,8 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandl
             return "permission"
         }
         endCall()
-        mic = MicArbiter.beginDictation()
+        // A plugin's recorder is still closing: refuse rather than open a second one.
+        mic = MicArbiter.beginDictation() ?: return "busy" 
         val marks = NativeTrial.marks(context.getSharedPreferences("speech_native", Context.MODE_PRIVATE))
         val c = CallCapture(main, captureListener) { SpeechGates.create(context.assets, it, marks) }
         c.bargeIn = bargeIn
@@ -294,10 +295,8 @@ class SpeechPlugin : FlutterPlugin, ActivityAware, MethodChannel.MethodCallHandl
         c?.stop()
         if (c != null) keepScreenOn(false)
         stream?.takeIf { it.call }?.stop()
-        if (mic != 0) {
-            MicArbiter.endDictation(mic)
-            mic = 0
-        }
+        mic?.let { MicArbiter.endDictation(it) }
+        mic = null
         val am = audio
         val mode = previousMode
         previousMode = null

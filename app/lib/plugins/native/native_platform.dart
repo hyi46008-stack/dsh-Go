@@ -17,7 +17,7 @@ class MethodNativeMediaPlatform implements NativeMediaPlatform {
       final result = await _methods.invokeMethod<Object?>('capabilities');
       final features = result is Map ? result['features'] : null;
       if (features is! List) return const {};
-      return features.whereType<String>().where({'audio', 'voice', 'overlay'}.contains).toSet();
+      return features.whereType<String>().where({'audio', 'voice', 'overlay', 'mic'}.contains).toSet();
     } on MissingPluginException {
       return const {};
     } on PlatformException {

@@ -1,0 +1,278 @@
+# Fork 侧审计（仅 hyi46008-stack/dsh-Go）。新增文件，不修改上游工作流。
+#
+# 三类检查：
+#   1) 差异密钥扫描（push / PR / 手动）：只扫「基准..当前提交」，发现真实密钥即硬失败
+#   2) 全量密钥扫描（每周一 / 手动）：工作树整体扫描，只报告不阻塞（上游测试夹具含大量假值）
+#   3) 改动文件 lint：node --check 硬失败；eslint / ktlint 只报告（仓库本就没有这两套配置）
+# 不关闭任何 gitleaks 规则，也不对历史文件做整体豁免。
+name: Fork Audit
+
+on:
+  push:
+    branches: [main, ci/apk]
+  pull_request:
+  schedule:
+    - cron: '0 3 * * 1' # 每周一 03:00 UTC 全量扫描
+  workflow_dispatch:
+    inputs:
+      base:
+        description: '手动指定差异扫描的基准 SHA（留空则自动推断）'
+        required: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 24.22.1
+  GITLEAKS_VERSION: 8.30.1
+  KTLINT_VERSION: 1.8.0
+
+jobs:
+  diff-secrets:
+    name: Diff secret scan
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 50
+          persist-credentials: false
+
+      - name: 解析基准 SHA
+        id: base
+        env:
+          EVENT: ${{ github.event_name }}
+          BEFORE: ${{ github.event.before }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          MANUAL_BASE: ${{ inputs.base }}
+        run: |
+          set -euo pipefail
+          base=""
+          case "$EVENT" in
+            pull_request) base="$PR_BASE" ;;
+            push) base="$BEFORE" ;;
+            *) base="$MANUAL_BASE" ;;
+          esac
+          # 新分支/手工触发时 before 是 40 个 0，或根本没给
+          if [ -z "${base:-}" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+            base=""
+          fi
+          # 兜底：与 origin/main 的合并基点；再不行退到 HEAD~1；再不行只扫最后一个提交
+          if [ -z "$base" ]; then
+            git fetch --no-tags --depth=50 origin main >/dev/null 2>&1 || true
+            if git rev-parse --verify -q origin/main >/dev/null; then
+              base=$(git merge-base HEAD origin/main 2>/dev/null || true)
+            fi
+          fi
+          if [ -n "$base" ] && ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$base" >/dev/null 2>&1 || true
+          fi
+          if [ -z "$base" ] || ! git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            if git rev-parse --verify -q HEAD~1 >/dev/null; then
+              base=$(git rev-parse HEAD~1)
+            fi
+          fi
+          if [ -n "$base" ] && git cat-file -e "${base}^{commit}" 2>/dev/null; then
+            echo "基准 SHA：$base（$(git log -1 --format=%h\\ %s "$base")）"
+            echo "range=$base..HEAD" >> "$GITHUB_OUTPUT"
+            echo "base=$base" >> "$GITHUB_OUTPUT"
+          else
+            echo "没有可用基准（可能是首个提交）：只扫描 HEAD 这一个提交"
+            echo "range=-1" >> "$GITHUB_OUTPUT"
+            echo "base=HEAD~1(缺失)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 安装 gitleaks ${{ env.GITLEAKS_VERSION }}
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+
+      # 硬失败：本次变更里出现真实密钥
+      - name: 差异扫描（硬失败）
+        id: scan
+        run: |
+          set -uo pipefail
+          range="${{ steps.base.outputs.range }}"
+          echo "扫描区间：$range"
+          set +e
+          "$RUNNER_TEMP/gitleaks" detect --log-opts="$range" --no-banner --redact \
+            --exit-code 1 --report-format json --report-path "$RUNNER_TEMP/diff-report.json" --verbose
+          code=$?
+          set -e
+          count=$(node -e "try{console.log(require(process.argv[1]).length)}catch(e){console.log(0)}" "$RUNNER_TEMP/diff-report.json")
+          echo "findings=$count" >> "$GITHUB_OUTPUT"
+          echo "exit=$code" >> "$GITHUB_OUTPUT"
+          echo "本次变更内命中：$count 条"
+          exit $code
+
+      - name: 差异扫描报告
+        if: always()
+        run: |
+          {
+            echo "## 差异密钥扫描"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 事件 | ${{ github.event_name }} |"
+            echo "| 基准 | \`${{ steps.base.outputs.base }}\` |"
+            echo "| 扫描区间 | \`${{ steps.base.outputs.range }}\` |"
+            echo "| 命中 | ${{ steps.scan.outputs.findings || '0' }} 条 |"
+            echo "| 结果 | ${{ steps.scan.outcome == 'success' && '通过' || '失败（需要处理）' }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: gitleaks-diff-${{ github.sha }}
+          path: ${{ runner.temp }}/diff-report.json
+          retention-days: 14
+          if-no-files-found: ignore
+
+  full-secrets:
+    name: Full secret scan (report only)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: 安装 gitleaks ${{ env.GITLEAKS_VERSION }}
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+
+      - name: 全量扫描（只报告，不阻塞）
+        run: |
+          set -uo pipefail
+          "$RUNNER_TEMP/gitleaks" detect --no-git --source . --no-banner --redact \
+            --exit-code 0 --report-format json --report-path "$RUNNER_TEMP/full-report.json" >/dev/null 2>&1 || true
+          node -e '
+            const r = JSON.parse(require("node:fs").readFileSync(process.argv[1], "utf8"))
+            const byFile = {}, byRule = {}
+            for (const f of r) {
+              byFile[f.File] = (byFile[f.File] || 0) + 1
+              byRule[f.RuleID] = (byRule[f.RuleID] || 0) + 1
+            }
+            const top = Object.entries(byFile).sort((a, b) => b[1] - a[1]).slice(0, 10)
+            const out = [`## 全量密钥扫描（只报告）`, ``, `命中 ${r.length} 条，涉及 ${Object.keys(byFile).length} 个文件`, ``, `| 规则 | 条数 |`, `|---|---|`]
+            for (const [k, v] of Object.entries(byRule).sort((a, b) => b[1] - a[1])) out.push(`| ${k} | ${v} |`)
+            out.push(``, `| 命中最多的文件 | 条数 |`, `|---|---|`)
+            for (const [f, n] of top) out.push(`| ${f} | ${n} |`)
+            const text = out.join("\n")
+            console.log(text)
+            require("node:fs").appendFileSync(process.env.GITHUB_STEP_SUMMARY, text + "\n")
+          ' "$RUNNER_TEMP/full-report.json"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: gitleaks-full-${{ github.run_id }}
+          path: ${{ runner.temp }}/full-report.json
+          retention-days: 30
+          if-no-files-found: ignore
+
+  lint:
+    name: Changed-file lint
+    if: github.event_name == 'push' || github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 找出本分支改动的文件
+        id: changed
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            git diff --name-only "origin/${{ github.base_ref }}...HEAD" > "$RUNNER_TEMP/changed.txt" || true
+          else
+            git diff --name-only HEAD~1 HEAD > "$RUNNER_TEMP/changed.txt" 2>/dev/null || : > "$RUNNER_TEMP/changed.txt"
+          fi
+          js=$(grep -E '\.(js|mjs|cjs)$' "$RUNNER_TEMP/changed.txt" | grep -v '^$' | sort -u || true)
+          kt=$(grep -E '\.kt$' "$RUNNER_TEMP/changed.txt" | grep -v '^$' | sort -u || true)
+          echo "js_count=$(printf '%s' "$js" | grep -c . || true)" >> "$GITHUB_OUTPUT"
+          echo "kt_count=$(printf '%s' "$kt" | grep -c . || true)" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$js" > "$RUNNER_TEMP/changed-js.txt"
+          printf '%s\n' "$kt" > "$RUNNER_TEMP/changed-kt.txt"
+          echo "改动文件 $(grep -c . "$RUNNER_TEMP/changed.txt" || true) 个：JS $(printf '%s' "$js" | grep -c . || true)，Kotlin $(printf '%s' "$kt" | grep -c . || true)"
+
+      - name: JS 语法检查（node --check，硬失败）
+        if: steps.changed.outputs.js_count != '0'
+        run: |
+          set -euo pipefail
+          fail=0
+          while read -r f; do
+            [ -n "$f" ] || continue
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.cjs) node --check "$f" || fail=1 ;;
+              *.js|*.mjs) node --input-type=module --check < "$f" || fail=1 ;;
+            esac
+          done < "$RUNNER_TEMP/changed-js.txt"
+          exit $fail
+
+      - name: ESLint（只报告）
+        if: steps.changed.outputs.js_count != '0'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cat > "$RUNNER_TEMP/eslint.config.mjs" <<'EOF'
+          export default [
+            {
+              files: ['**/*.js', '**/*.mjs', '**/*.cjs'],
+              languageOptions: { ecmaVersion: 2024, sourceType: 'module' },
+              rules: {
+                'no-undef': 'off',
+                'no-unused-vars': 'warn',
+                'no-unreachable': 'error',
+                'no-dupe-keys': 'error',
+                'no-constant-condition': 'warn',
+              },
+            },
+          ]
+          EOF
+          mapfile -t files < <(grep -v '^$' "$RUNNER_TEMP/changed-js.txt" | while read -r f; do [ -f "$f" ] && echo "$f"; done)
+          [ ${#files[@]} -gt 0 ] || exit 0
+          npx --yes eslint@9 --no-config-lookup -c "$RUNNER_TEMP/eslint.config.mjs" -f stylish "${files[@]}"
+
+      - name: ktlint（只报告）
+        if: steps.changed.outputs.kt_count != '0'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          curl -sSL -o "$RUNNER_TEMP/ktlint" \
+            "https://github.com/ktlint/ktlint/releases/download/${KTLINT_VERSION}/ktlint"
+          chmod +x "$RUNNER_TEMP/ktlint"
+          mapfile -t files < <(grep -v '^$' "$RUNNER_TEMP/changed-kt.txt" | while read -r f; do [ -f "$f" ] && echo "$f"; done)
+          [ ${#files[@]} -gt 0 ] || exit 0
+          "$RUNNER_TEMP/ktlint" "${files[@]}"
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "## 改动文件 lint"
+            echo ""
+            echo "| 检查 | 结果 |"
+            echo "|---|---|"
+            echo "| JS 改动文件 | ${{ steps.changed.outputs.js_count }} 个（node --check 硬失败） |"
+            echo "| Kotlin 改动文件 | ${{ steps.changed.outputs.kt_count }} 个（ktlint 只报告） |"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -525,7 +525,7 @@ export interface ManifestAction {
   icon?: ManifestIconName
   /** Static effect(s) executed by the app without invoke. */
   effect?: InvokeStaticEffect | InvokeStaticEffect[]
-  requires?: Array<"audio" | "voice" | "micro" | "overlay" | "files">
+  requires?: Array<"audio" | "voice" | "micro" | "overlay" | "files" | "mic">
 }
 
 export interface ManifestStrip {
@@ -557,7 +557,7 @@ export interface ManifestTool {
   icon?: ManifestIconName
   /** Static effect(s) executed by the app without invoke. */
   effect?: InvokeStaticEffect | InvokeStaticEffect[]
-  requires?: Array<"audio" | "voice" | "micro" | "overlay" | "files">
+  requires?: Array<"audio" | "voice" | "micro" | "overlay" | "files" | "mic">
   /** Opens this plugin's panel. Write panel or effect, not both. */
   panel?: ManifestId
 }
@@ -840,7 +840,7 @@ export interface ContributionsPlugin {
     }[]
   }
   issues: ContributionsIssue[]
-  capabilities?: Array<"audio" | "voice" | "micro" | "overlay" | "files">
+  capabilities?: Array<"audio" | "voice" | "micro" | "overlay" | "files" | "mic">
 }
 
 export interface ContributionsAction {
@@ -850,7 +850,7 @@ export interface ContributionsAction {
   /** Present: the app executes it locally and never invokes */
   effect?: InvokeStaticEffect[]
   ready: boolean
-  requires?: Array<"audio" | "voice" | "micro" | "overlay" | "files">
+  requires?: Array<"audio" | "voice" | "micro" | "overlay" | "files" | "mic">
 }
 
 export interface ContributionsStrip {

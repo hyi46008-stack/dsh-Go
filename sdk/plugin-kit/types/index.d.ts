@@ -49,7 +49,17 @@ export interface InvokeScopeWithContext extends Scope {
 export type Capability = NonNullable<Manifest['capabilities']>[number]
 export interface MicroData { text?: string; progress?: number | null }
 /** signal follows the lease. After final terminal dispatch it is aborted, including in async continuations; record the event before awaiting and do not use it to extend ownership. */
-export interface CapabilityEvent { instance: string; event: 'audio.ended' | 'audio.stopped' | 'audio.error' | 'voice.speechStart' | 'voice.speechEnd' | 'voice.stopped' | 'voice.error' | 'overlay.closed'; reason?: string; seq: number; signal: AbortSignal }
+export interface CapabilityEvent { instance: string; event: 'audio.ended' | 'audio.stopped' | 'audio.error' | 'voice.speechStart' | 'voice.speechEnd' | 'voice.stopped' | 'voice.error' | 'overlay.closed' | 'mic.stopped' | 'mic.error'; reason?: string; seq: number; signal: AbortSignal }
+
+/** One PCM16 frame of an authorized `mic` capture: 16 kHz, mono, 20 ms (640 bytes at most). */
+export interface MicFrame {
+  frame: Uint8Array
+  seq: number
+  rate: 16000
+  channels: 1
+  bitsPerSample: 16
+  signal: AbortSignal
+}
 export interface Caps {
   features?: Capability[]
   protocol: number
@@ -132,6 +142,11 @@ export interface DshGoService {
   media(id: string, handler: (scope: Scope, event: { key?: string; locale: string; signal: AbortSignal }) => { body: Uint8Array; contentType: 'audio/mpeg' | 'audio/wav' | 'audio/ogg' | 'audio/mp4' | 'audio/aac' } | Promise<{ body: Uint8Array; contentType: 'audio/mpeg' | 'audio/wav' | 'audio/ogg' | 'audio/mp4' | 'audio/aac' }>): Cancel
   micro(id: string, def: { data: DataFunction<MicroData> }): Cancel
   onCapability(handler: (scope: Scope, event: CapabilityEvent) => void | Promise<void>): Cancel
+  /**
+   * v1.4: PCM frames of this plugin's own `mic` capture (one lease at a time). Frames are dropped,
+   * never queued, when the plugin is slower than the microphone. Needs `capabilities: ['mic']`.
+   */
+  onMic(handler: (scope: Scope, frame: MicFrame) => void | Promise<void>): Cancel
   panel<D = Record<string, unknown>>(id: string, def: PanelDefinition<D>): Cancel
   strip(id: string, data: DataFunction<StreamStripData & {}> | { data: DataFunction<StreamStripData & {}> }): Cancel
   /**

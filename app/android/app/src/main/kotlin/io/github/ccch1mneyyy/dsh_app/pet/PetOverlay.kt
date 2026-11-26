@@ -2166,7 +2166,7 @@ internal object PetOverlay {
     // ---- 语音问 ---------------------------------------------------------------------------------
 
     private var recorder: WavRecorder? = null
-    private var recorderMic = 0
+    private var recorderMic: Int? = null
     private var recording = 0L
 
     /** Hold to talk: the offline voice model's recorder, as the chat's dictation records for it. */
@@ -2198,6 +2198,12 @@ internal object PetOverlay {
             } },
         )
         val mic = MicArbiter.beginDictation()
+        if (mic == null) {
+            // A plugin's recorder is still closing: no second recorder, tell the person.
+            runCatching { r.discard() }
+            view.setStatus(AppStrings.get(app, R.string.pet_ask_not_heard), error = true)
+            return
+        }
         if (!runCatching { r.start() }.getOrDefault(false)) {
             MicArbiter.endDictation(mic)
             foregroundVoice(view)
@@ -2246,7 +2252,7 @@ internal object PetOverlay {
         if (cancelled) {
             worker.execute {
                 runCatching { r.discard() }
-                main.post { MicArbiter.endDictation(mic) }
+                main.post { mic?.let { MicArbiter.endDictation(it) } }
             }
             view?.setStatus(null)
             return
@@ -2255,7 +2261,7 @@ internal object PetOverlay {
         worker.execute {
             val wav = runCatching { r.finish() }.getOrNull()
             main.post {
-                MicArbiter.endDictation(mic)
+                mic?.let { MicArbiter.endDictation(it) }
                 if (gen != recording || view == null || askView !== view) return@post
                 if (wav == null || wav.size < MIN_WAV_BYTES) {
                     view.setStatus(AppStrings.get(app, R.string.pet_ask_not_heard))
@@ -2284,7 +2290,7 @@ internal object PetOverlay {
         askView?.setState(listening = false)
         worker.execute {
             runCatching { r.discard() }
-            main.post { MicArbiter.endDictation(mic) }
+            main.post { mic?.let { MicArbiter.endDictation(it) } }
         }
     }
 

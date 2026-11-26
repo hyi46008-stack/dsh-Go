@@ -5,6 +5,7 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
+import 'dart:typed_data';
 
 import 'package:dsh_client/dsh_client.dart';
 import 'package:test/test.dart';
@@ -381,5 +382,63 @@ void main() {
       await serving.cancel();
       await server.close();
     }
+  });
+
+  group('mic frames', () {
+    test('a frame goes out only when mic is negotiated', () async {
+      final socket = _Socket()..agree = ['mic'];
+      final stream = DshGoStream(() async => socket, features: const ['mic']);
+      addTearDown(stream.close);
+      await stream.hold();
+      expect(stream.negotiatedFeatures, {'mic'});
+      final pcm = Uint8List.fromList([1, 0, -2, -1]);
+      expect(stream.micFrame('lease', 1, pcm), isTrue);
+      final sent = socket.sent.lastWhere((m) => m['t'] == 'mic.frame');
+      expect((sent['lease'], sent['seq'], sent['pcm']), ('lease', 1, base64Encode(pcm)));
+
+      expect(stream.micFrame('lease', 0, pcm), isFalse, reason: 'seq starts at 1');
+      expect(stream.micFrame('lease', 2, Uint8List(1025)), isFalse, reason: '20 ms at most');
+      expect(stream.micFrame('lease', 3, Uint8List(3)), isFalse, reason: 'whole samples only');
+      expect(stream.micFrame('', 4, pcm), isFalse);
+
+      expect(stream.capabilityEvent('lease', 1, 'mic.stopped'), isTrue);
+      expect(socket.sent.lastWhere((m) => m['t'] == 'cap.event')['event'], 'mic.stopped');
+      stream.release();
+    });
+
+    test('mic.status reports what the bridge accepted', () async {
+      final socket = _Socket()..agree = ['mic'];
+      final stream = DshGoStream(() async => socket, features: const ['mic']);
+      addTearDown(stream.close);
+      await stream.hold();
+      final first = stream.micStats.first;
+      socket.receive({'t': 'mic.status', 'lease': 'L1', 'seq': 9, 'got': 8, 'dropped': 1, 'pending': 2});
+      final status = await first.timeout(const Duration(seconds: 1));
+      expect((status.lease, status.seq, status.got, status.dropped, status.pending), ('L1', 9, 8, 1, 2));
+      stream.release();
+    });
+
+    test('mic.end from the bridge reaches the app', () async {
+      final socket = _Socket()..agree = ['mic'];
+      final stream = DshGoStream(() async => socket, features: const ['mic']);
+      addTearDown(stream.close);
+      await stream.hold();
+      final ended = stream.micEnds.first;
+      socket.receive({'t': 'mic.end', 'lease': 'L1', 'reason': 'revoked'});
+      final event = await ended.timeout(const Duration(seconds: 1));
+      expect((event.lease, event.reason), ('L1', 'revoked'));
+      stream.release();
+    });
+
+    test('without the feature nothing is queued or sent', () async {
+      final socket = _Socket();
+      final stream = DshGoStream(() async => socket);
+      addTearDown(stream.close);
+      await stream.hold();
+      expect(stream.micFrame('lease', 1, Uint8List(640)), isFalse);
+      expect(socket.sent.where((m) => m['t'] == 'mic.frame'), isEmpty);
+      expect(stream.capabilityEvent('lease', 1, 'mic.error'), isFalse);
+      stream.release();
+    });
   });
 }

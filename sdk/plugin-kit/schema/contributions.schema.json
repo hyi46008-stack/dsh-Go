@@ -236,7 +236,8 @@
               "voice",
               "micro",
               "overlay",
-              "files"
+              "files",
+              "mic"
             ]
           }
         }
@@ -281,7 +282,8 @@
               "voice",
               "micro",
               "overlay",
-              "files"
+              "files",
+              "mic"
             ]
           }
         }
