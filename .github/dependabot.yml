@@ -1,0 +1,15 @@
+# 仅在本 fork 生效；不修改上游配置。
+# 只盯 GitHub Actions 自身版本，避免把 npm 依赖的批量升级噪音引进来。
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: 'ci'
+    labels:
+      - dependencies
+      - github-actions

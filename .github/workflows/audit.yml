@@ -1,0 +1,148 @@
+# Fork 侧审计（仅 hyi46008-stack/dsh-Go）。新增文件，不修改上游工作流。
+#
+# 三条互不牵连的检查：
+#   1) secret 扫描（gitleaks，全历史）—— 唯一硬失败项
+#   2) 改动文件的 JS 语法检查（node --check）—— 硬失败，但只看本分支新增/改动的文件
+#   3) 改动文件的 ESLint / ktlint —— 只报告，先不阻塞（存量代码没有这两套配置）
+name: Fork Audit
+
+on:
+  push:
+    branches: [main, ci/apk]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: audit-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: 24.22.1
+  GITLEAKS_VERSION: 8.30.1
+  KTLINT_VERSION: 1.8.0
+
+jobs:
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: 安装 gitleaks
+        run: |
+          curl -sSL -o "$RUNNER_TEMP/gitleaks.tgz" \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          tar -xzf "$RUNNER_TEMP/gitleaks.tgz" -C "$RUNNER_TEMP" gitleaks
+          "$RUNNER_TEMP/gitleaks" version
+
+      # 硬失败：当前代码树里出现了真密钥/私钥/令牌
+      - name: 扫描工作树（硬失败）
+        run: |
+          "$RUNNER_TEMP/gitleaks" detect --no-git --source . --no-banner --redact --exit-code 1 --verbose
+
+      # 只报告：上游历史里的旧提交可能有测试用假密钥，不因历史阻塞
+      - name: 扫描全历史（只报告）
+        continue-on-error: true
+        run: |
+          "$RUNNER_TEMP/gitleaks" detect --source . --no-banner --redact --exit-code 0 --verbose
+
+  lint:
+    name: Changed-file lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: 找出本分支改动的文件
+        id: changed
+        run: |
+          set -euo pipefail
+          if [ -n "${{ github.base_ref }}" ]; then
+            git fetch --no-tags --depth=1 origin "${{ github.base_ref }}"
+            git diff --name-only "origin/${{ github.base_ref }}...HEAD" > "$RUNNER_TEMP/changed.txt" || true
+          else
+            git diff --name-only HEAD~1 HEAD > "$RUNNER_TEMP/changed.txt" 2>/dev/null || : > "$RUNNER_TEMP/changed.txt"
+          fi
+          js=$(grep -E '\.(js|mjs|cjs)$' "$RUNNER_TEMP/changed.txt" | grep -v '^$' | sort -u || true)
+          kt=$(grep -E '\.kt$' "$RUNNER_TEMP/changed.txt" | grep -v '^$' | sort -u || true)
+          echo "js_count=$(printf '%s' "$js" | grep -c . || true)" >> "$GITHUB_OUTPUT"
+          echo "kt_count=$(printf '%s' "$kt" | grep -c . || true)" >> "$GITHUB_OUTPUT"
+          printf '%s\n' "$js" > "$RUNNER_TEMP/changed-js.txt"
+          printf '%s\n' "$kt" > "$RUNNER_TEMP/changed-kt.txt"
+          echo "改动文件总数：$(grep -c . "$RUNNER_TEMP/changed.txt" || true)，JS $(printf '%s' "$js" | grep -c . || true) 个，Kotlin $(printf '%s' "$kt" | grep -c . || true) 个"
+
+      - name: JS 语法检查（node --check，硬失败）
+        if: steps.changed.outputs.js_count != '0'
+        run: |
+          set -euo pipefail
+          fail=0
+          while read -r f; do
+            [ -n "$f" ] || continue
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.cjs) node --check "$f" || fail=1 ;;
+              *.js|*.mjs) node --input-type=module --check < "$f" || fail=1 ;;
+            esac
+          done < "$RUNNER_TEMP/changed-js.txt"
+          exit $fail
+
+      - name: ESLint（只报告，不阻塞）
+        if: steps.changed.outputs.js_count != '0'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          cat > "$RUNNER_TEMP/eslint.config.mjs" <<'EOF'
+          export default [
+            {
+              files: ['**/*.js', '**/*.mjs', '**/*.cjs'],
+              languageOptions: { ecmaVersion: 2024, sourceType: 'module' },
+              rules: {
+                'no-undef': 'off',
+                'no-unused-vars': 'warn',
+                'no-unreachable': 'error',
+                'no-dupe-keys': 'error',
+                'no-constant-condition': 'warn',
+              },
+            },
+          ]
+          EOF
+          mapfile -t files < <(grep -v '^$' "$RUNNER_TEMP/changed-js.txt" | while read -r f; do [ -f "$f" ] && echo "$f"; done)
+          [ ${#files[@]} -gt 0 ] || exit 0
+          npx --yes eslint@9 --no-config-lookup -c "$RUNNER_TEMP/eslint.config.mjs" -f stylish "${files[@]}"
+
+      - name: ktlint（只报告，不阻塞）
+        if: steps.changed.outputs.kt_count != '0'
+        continue-on-error: true
+        run: |
+          set -uo pipefail
+          curl -sSL -o "$RUNNER_TEMP/ktlint" \
+            "https://github.com/ktlint/ktlint/releases/download/${KTLINT_VERSION}/ktlint"
+          chmod +x "$RUNNER_TEMP/ktlint"
+          mapfile -t files < <(grep -v '^$' "$RUNNER_TEMP/changed-kt.txt" | while read -r f; do [ -f "$f" ] && echo "$f"; done)
+          [ ${#files[@]} -gt 0 ] || exit 0
+          "$RUNNER_TEMP/ktlint" "${files[@]}"
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "## Fork Audit 摘要"
+            echo ""
+            echo "| 检查 | 结果 |"
+            echo "|---|---|"
+            echo "| Secret 扫描 | 见 Secret scan job |"
+            echo "| JS 改动文件 | ${{ steps.changed.outputs.js_count }} 个（node --check 硬失败） |"
+            echo "| Kotlin 改动文件 | ${{ steps.changed.outputs.kt_count }} 个（ktlint 只报告） |"
+          } >> "$GITHUB_STEP_SUMMARY"

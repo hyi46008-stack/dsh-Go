@@ -1,0 +1,185 @@
+# Debug APK 构建（仅 fork：hyi46008-stack/dsh-Go）。
+# 新增文件，不修改上游任何工作流；上游 ci.yml / runtime.yml 保持原样。
+#
+# 触发：手动（Actions → Android Debug APK → Run workflow）或向 ci/apk 分支推送。
+# 产物：Debug APK + SHA256SUMS + build-report.md，作为 Actions Artifact 保存。
+#
+# 说明：
+# - 只出 Debug 包，不配置签名、不上传 keystore。
+# - --no-companion：跳过不在仓库里的授权素材包。
+# - runtime bundle 与 APK 在同一个 job 里构建，省掉一次上百 MB 的 artifact 往返。
+name: Android Debug APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      flavor:
+        description: 'flavor（默认 arm64）'
+        required: false
+        default: arm64
+        type: choice
+        options: [arm64, x64]
+  push:
+    branches: [ci/apk]
+    paths:
+      - '.github/workflows/android-apk.yml'
+      - 'tooling/build-apk.sh'
+
+permissions:
+  contents: write   # 仅用于在 fork 里发布 ci-latest prerelease；不推 tag 到上游
+
+concurrency:
+  group: apk-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  FLUTTER_VERSION: 3.47.7
+  NODE_VERSION: 24.22.1
+  GRADLE_VERSION: 9.3.1
+  TZ: Asia/Shanghai
+
+jobs:
+  apk:
+    name: Debug APK (${{ inputs.flavor || 'arm64' }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          persist-credentials: false
+
+      - name: Restore the runtime download cache
+        id: cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: runtime/.cache
+          key: runtime-downloads-v1-${{ hashFiles('runtime/build-runtime.sh', 'runtime/locks/**') }}
+          restore-keys: runtime-downloads-v1-
+
+      - name: Build the arm64 runtime bundle
+        run: runtime/build-runtime.sh arm64-v8a
+
+      - name: Check the bundle
+        run: python3 -I tooling/check_runtime_bundle.py arm64
+
+      - name: Save the runtime download cache
+        if: steps.cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: runtime/.cache
+          key: ${{ steps.cache.outputs.cache-primary-key }}
+
+      - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@1a449444c387b1966244ae4d4f8c696479add0b2 # v2
+        with:
+          flutter-version: ${{ env.FLUTTER_VERSION }}
+          channel: stable
+          cache: true
+
+      - name: Flutter plugins and local.properties
+        working-directory: app
+        run: |
+          flutter pub get --enforce-lockfile
+          printf 'sdk.dir=%s\nflutter.sdk=%s\n' "$ANDROID_HOME" "$FLUTTER_ROOT" > android/local.properties
+
+      - uses: gradle/actions/setup-gradle@8da46b539cd8fe6ab27ca75128919a18d757604c # v6.4.1
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Build debug APK
+        id: build
+        run: |
+          set -o pipefail
+          started=$(date +%s)
+          tooling/build-apk.sh --debug --no-companion -f "${{ inputs.flavor || 'arm64' }}" 2>&1 | tee "$RUNNER_TEMP/apk-build.log"
+          echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+
+      - name: Collect APK info
+        id: meta
+        run: |
+          set -euo pipefail
+          apk=$(ls -1t app/build/app/outputs/flutter-apk/*.apk | head -1)
+          test -n "$apk"
+          {
+            echo "path=$apk"
+            echo "name=$(basename "$apk")"
+            echo "sha256=$(sha256sum "$apk" | cut -d' ' -f1)"
+            echo "size=$(stat -c %s "$apk")"
+            echo "version=$(sed -n 's/^version:[[:space:]]*//p' app/pubspec.yaml | head -1)"
+          } >> "$GITHUB_OUTPUT"
+          sha256sum "$apk" | sed "s# .*/# #" > "$RUNNER_TEMP/SHA256SUMS"
+
+      - name: Build report
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          BUILD_SECONDS: ${{ steps.build.outputs.seconds }}
+          APK_NAME: ${{ steps.meta.outputs.name }}
+          APK_SIZE: ${{ steps.meta.outputs.size }}
+          APK_SHA: ${{ steps.meta.outputs.sha256 }}
+          APK_VERSION: ${{ steps.meta.outputs.version }}
+        run: |
+          if [ "$BUILD_OUTCOME" = "success" ]; then
+            verdict="成功"
+            hint="APK 已可安装：手机端允许安装未知来源后点开下载。"
+          else
+            verdict="失败"
+            hint="看上面 Build debug APK 的日志；常见原因：runtime bundle 未生成、local.properties 缺 flutter.sdk、Gradle/AGP 版本不匹配、依赖下载失败。"
+          fi
+          size_text="未产出"
+          if [ -n "${APK_SIZE:-}" ]; then size_text="$((APK_SIZE / 1024 / 1024)) MB ($APK_SIZE B)"; fi
+          {
+            echo "## Android Debug APK 构建报告"
+            echo ""
+            echo "| 项目 | 值 |"
+            echo "|---|---|"
+            echo "| 结果 | $verdict |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo "| 分支 | \`${{ github.ref_name }}\` |"
+            echo "| 版本名（pubspec） | ${APK_VERSION:-未知} |"
+            echo "| 构建耗时 | ${BUILD_SECONDS:-未记录} 秒 |"
+            echo "| APK | ${APK_NAME:-未产出} |"
+            echo "| 大小 | $size_text |"
+            echo "| SHA256 | ${APK_SHA:-未产出} |"
+            echo "| 诊断建议 | $hint |"
+            echo ""
+            echo "运行时：Flutter $FLUTTER_VERSION · JDK 17 · Gradle $GRADLE_VERSION · ubuntu-24.04 · Debug · --no-companion"
+          } > "$RUNNER_TEMP/build-report.md"
+          cat "$RUNNER_TEMP/build-report.md" >> "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        if: always()
+        with:
+          name: apk-debug-${{ github.sha }}
+          path: |
+            app/build/app/outputs/flutter-apk/*.apk
+            ${{ runner.temp }}/SHA256SUMS
+            ${{ runner.temp }}/build-report.md
+            ${{ runner.temp }}/apk-build.log
+          retention-days: 14
+          if-no-files-found: warn
+
+      # Artifact 下载需要登录；这里再发一份到 fork 自己的 prerelease，
+      # 手机和浏览器都能匿名直接下。只在 fork 里发生，不碰官方 Release。
+      - name: Publish to fork prerelease (anonymous download)
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ci-latest
+        run: |
+          set -uo pipefail
+          gh release delete "$TAG" --cleanup-tag --yes >/dev/null 2>&1 || true
+          files=()
+          for f in app/build/app/outputs/flutter-apk/*.apk "$RUNNER_TEMP/SHA256SUMS" "$RUNNER_TEMP/build-report.md" "$RUNNER_TEMP/apk-build.log"; do
+            [ -f "$f" ] && files+=("$f")
+          done
+          if [ ${#files[@]} -eq 0 ]; then echo "没有可发布的产物"; exit 0; fi
+          gh release create "$TAG" \
+            --title "CI 最新构建（Debug）" \
+            --notes-file "$RUNNER_TEMP/build-report.md" \
+            --prerelease \
+            "${files[@]}"
