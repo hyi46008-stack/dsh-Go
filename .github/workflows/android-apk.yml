@@ -1,32 +1,32 @@
-# Debug APK 构建（仅 fork：hyi46008-stack/dsh-Go）。
-# 新增文件，不修改上游任何工作流；上游 ci.yml / runtime.yml 保持原样。
+# Debug APK 构建（仅 fork：hyi46008-stack/dsh-Go）。新增文件，不修改上游工作流。
 #
 # 触发：手动（Actions → Android Debug APK → Run workflow）或向 ci/apk 分支推送。
-# 产物：Debug APK + SHA256SUMS + build-report.md，作为 Actions Artifact 保存。
+# 产物：一个正常 Debug APK + 一个 --side 侧装 Debug APK（包名 .test，可与正式版共存），
+#       以及 SHA256SUMS / build-report.md / 构建日志，作为 Actions Artifact 保存；
+#       另发一份到 fork 自己的 ci-latest prerelease（匿名下载）。
 #
-# 说明：
-# - 只出 Debug 包，不配置签名、不上传 keystore。
-# - --no-companion：跳过不在仓库里的授权素材包。
-# - runtime bundle 与 APK 在同一个 job 里构建，省掉一次上百 MB 的 artifact 往返。
+# 为什么不直接用 tooling/build-apk.sh --side：脚本要求 --side 只能配 release 模式，
+# 而 release 模式必须编出 libtawcroot.so（需要 NDK 28.2.13676358，本轮暂缓）。
+# 侧装能力本身来自 app/android/app/build.gradle.kts:24 的 DSH_SIDE_BUILD=1
+# （applicationIdSuffix=.test、应用名 DSH Go 测试、独立数据），这里直接走 flutter build apk。
 name: Android Debug APK
 
 on:
   workflow_dispatch:
     inputs:
-      flavor:
-        description: 'flavor（默认 arm64）'
+      variant:
+        description: '构建哪些包（both = 正常包 + 侧装包）'
         required: false
-        default: arm64
+        default: both
         type: choice
-        options: [arm64, x64]
+        options: [both, primary, side]
   push:
     branches: [ci/apk]
     paths:
       - '.github/workflows/android-apk.yml'
-      - 'tooling/build-apk.sh'
 
 permissions:
-  contents: write   # 仅用于在 fork 里发布 ci-latest prerelease；不推 tag 到上游
+  contents: write # 仅用于在 fork 里发布 ci-latest prerelease
 
 concurrency:
   group: apk-${{ github.ref }}
@@ -40,7 +40,7 @@ env:
 
 jobs:
   apk:
-    name: Debug APK (${{ inputs.flavor || 'arm64' }})
+    name: Debug APK (arm64)
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
@@ -95,59 +95,104 @@ jobs:
         run: |
           set -o pipefail
           started=$(date +%s)
-          tooling/build-apk.sh --debug --no-companion -f "${{ inputs.flavor || 'arm64' }}" 2>&1 | tee "$RUNNER_TEMP/apk-build.log"
+          tooling/build-apk.sh --debug --no-companion -f arm64 2>&1 | tee "$RUNNER_TEMP/apk-build.log"
           echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+
+      - name: Build side debug APK (compatible with the installed release app)
+        id: side
+        if: inputs.variant != 'primary'
+        run: |
+          set -o pipefail
+          mkdir -p "$RUNNER_TEMP/dist"
+          primary=app/build/app/outputs/flutter-apk/app-arm64-debug.apk
+          cp "$primary" "$RUNNER_TEMP/dist/app-arm64-debug.apk"
+          version=$(sed -n 's/^version:[[:space:]]*//p' app/pubspec.yaml | head -1 | cut -d+ -f1)
+          code=$(python3 -I tooling/build_number.py)
+          started=$(date +%s)
+          (
+            cd app
+            DSH_SIDE_BUILD=1 flutter build apk --debug --flavor arm64 --target-platform android-arm64 \
+              --build-name "$version" --build-number "$code" \
+              --dart-define="DSH_APP_VERSION=$version+$code"
+          ) 2>&1 | tee "$RUNNER_TEMP/apk-build-side.log"
+          cp "$primary" "$RUNNER_TEMP/dist/app-arm64-debug-side.apk"
+          echo "seconds=$(( $(date +%s) - started ))" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "code=$code" >> "$GITHUB_OUTPUT"
 
       - name: Collect APK info
         id: meta
         run: |
           set -euo pipefail
-          apk=$(ls -1t app/build/app/outputs/flutter-apk/*.apk | head -1)
-          test -n "$apk"
+          mkdir -p "$RUNNER_TEMP/dist"
+          # 侧装步骤已经把正常包放进 dist；只跑了正常包时才需要再拷一次。
+          if [ ! -f "$RUNNER_TEMP/dist/app-arm64-debug.apk" ]; then
+            cp app/build/app/outputs/flutter-apk/app-arm64-debug.apk "$RUNNER_TEMP/dist/app-arm64-debug.apk"
+          fi
+          cd "$RUNNER_TEMP/dist"
+          sha256sum *.apk > SHA256SUMS
+          # aapt2 读回真实包名，侧装包必须是 .test
+          aapt2=$(command -v aapt2 || ls -1d "$ANDROID_HOME"/build-tools/*/aapt2 2>/dev/null | sort -V | tail -1 || true)
           {
-            echo "path=$apk"
-            echo "name=$(basename "$apk")"
-            echo "sha256=$(sha256sum "$apk" | cut -d' ' -f1)"
-            echo "size=$(stat -c %s "$apk")"
-            echo "version=$(sed -n 's/^version:[[:space:]]*//p' app/pubspec.yaml | head -1)"
-          } >> "$GITHUB_OUTPUT"
-          sha256sum "$apk" | sed "s# .*/# #" > "$RUNNER_TEMP/SHA256SUMS"
+            echo "## APK 标识"
+            echo "| 文件 | package | versionName | versionCode | 大小 | SHA256 |"
+            echo "|---|---|---|---|---|---|"
+            for f in *.apk; do
+              badge=""
+              [ -n "$aapt2" ] && badge=$("$aapt2" dump badging "$f" 2>/dev/null | sed -n '1p' || true)
+              pkg=$(printf '%s' "$badge" | sed -n "s/.*package: name='\([^']*\)'.*/\1/p")
+              vn=$(printf '%s' "$badge" | sed -n "s/.*versionName='\([^']*\)'.*/\1/p")
+              vc=$(printf '%s' "$badge" | sed -n "s/.*versionCode='\([^']*\)'.*/\1/p")
+              echo "| $f | ${pkg:-?} | ${vn:-?} | ${vc:-?} | $(( $(stat -c %s "$f") / 1048576 )) MB | $(sha256sum "$f" | cut -d' ' -f1) |"
+            done
+          } > "$RUNNER_TEMP/apk-identities.md"
+          cat "$RUNNER_TEMP/apk-identities.md"
+          sed -n '1,3p' SHA256SUMS
 
       - name: Build report
         if: always()
         env:
           BUILD_OUTCOME: ${{ steps.build.outcome }}
+          SIDE_OUTCOME: ${{ steps.side.outcome }}
           BUILD_SECONDS: ${{ steps.build.outputs.seconds }}
-          APK_NAME: ${{ steps.meta.outputs.name }}
-          APK_SIZE: ${{ steps.meta.outputs.size }}
-          APK_SHA: ${{ steps.meta.outputs.sha256 }}
-          APK_VERSION: ${{ steps.meta.outputs.version }}
+          SIDE_SECONDS: ${{ steps.side.outputs.seconds }}
         run: |
           if [ "$BUILD_OUTCOME" = "success" ]; then
             verdict="成功"
-            hint="APK 已可安装：手机端允许安装未知来源后点开下载。"
+            hint="正常包与侧装包都能装；侧装包与正式版共存，不覆盖数据。"
           else
             verdict="失败"
-            hint="看上面 Build debug APK 的日志；常见原因：runtime bundle 未生成、local.properties 缺 flutter.sdk、Gradle/AGP 版本不匹配、依赖下载失败。"
+            hint="看 Build debug APK 日志；常见原因：runtime bundle、local.properties、Gradle 版本、依赖下载。"
           fi
-          size_text="未产出"
-          if [ -n "${APK_SIZE:-}" ]; then size_text="$((APK_SIZE / 1024 / 1024)) MB ($APK_SIZE B)"; fi
+          side_text="未构建"
+          [ -n "${SIDE_SECONDS:-}" ] && side_text="成功（${SIDE_SECONDS} 秒）"
+          [ "$SIDE_OUTCOME" = "failure" ] && side_text="失败"
           {
             echo "## Android Debug APK 构建报告"
             echo ""
             echo "| 项目 | 值 |"
             echo "|---|---|"
-            echo "| 结果 | $verdict |"
+            echo "| 结果（正常包） | $verdict |"
+            echo "| 结果（侧装包） | $side_text |"
             echo "| Commit | \`${{ github.sha }}\` |"
             echo "| 分支 | \`${{ github.ref_name }}\` |"
-            echo "| 版本名（pubspec） | ${APK_VERSION:-未知} |"
-            echo "| 构建耗时 | ${BUILD_SECONDS:-未记录} 秒 |"
-            echo "| APK | ${APK_NAME:-未产出} |"
-            echo "| 大小 | $size_text |"
-            echo "| SHA256 | ${APK_SHA:-未产出} |"
+            echo "| 触发 | ${{ github.event_name }} / variant=${{ inputs.variant || 'both' }} |"
+            echo "| 正常包耗时 | ${BUILD_SECONDS:-未记录} 秒 |"
+            echo "| 侧装包耗时 | ${SIDE_SECONDS:-未构建} |"
             echo "| 诊断建议 | $hint |"
             echo ""
+            [ -f "$RUNNER_TEMP/apk-identities.md" ] && cat "$RUNNER_TEMP/apk-identities.md"
+            echo ""
             echo "运行时：Flutter $FLUTTER_VERSION · JDK 17 · Gradle $GRADLE_VERSION · ubuntu-24.04 · Debug · --no-companion"
+            # 失败时只附脱敏后的错误摘要（不公开原始日志与路径）
+            if [ "$BUILD_OUTCOME" = "failure" ] || [ "$SIDE_OUTCOME" = "failure" ]; then
+              echo ""
+              echo "### 失败摘要（已脱敏路径）"
+              echo '```'
+              grep -hiE "error|failed|FAILURE|Exception" "$RUNNER_TEMP/apk-build.log" "$RUNNER_TEMP/apk-build-side.log" 2>/dev/null \
+                | sed -E "s#$RUNNER_TEMP#<tmp>#g; s#$GITHUB_WORKSPACE#<ws>#g" | tail -20 || true
+              echo '```'
+            fi
           } > "$RUNNER_TEMP/build-report.md"
           cat "$RUNNER_TEMP/build-report.md" >> "$GITHUB_STEP_SUMMARY"
 
@@ -156,15 +201,16 @@ jobs:
         with:
           name: apk-debug-${{ github.sha }}
           path: |
-            app/build/app/outputs/flutter-apk/*.apk
-            ${{ runner.temp }}/SHA256SUMS
+            ${{ runner.temp }}/dist/*.apk
+            ${{ runner.temp }}/dist/SHA256SUMS
             ${{ runner.temp }}/build-report.md
             ${{ runner.temp }}/apk-build.log
+            ${{ runner.temp }}/apk-build-side.log
           retention-days: 14
           if-no-files-found: warn
 
-      # Artifact 下载需要登录；这里再发一份到 fork 自己的 prerelease，
-      # 手机和浏览器都能匿名直接下。只在 fork 里发生，不碰官方 Release。
+      # Artifact 下载需要登录；这里再发一份到 fork 自己的 prerelease，手机可匿名直接下。
+      # 只发脱敏后的报告与安装包，不发原始日志（避免环境信息外泄）。
       - name: Publish to fork prerelease (anonymous download)
         if: always()
         env:
@@ -174,12 +220,12 @@ jobs:
           set -uo pipefail
           gh release delete "$TAG" --cleanup-tag --yes >/dev/null 2>&1 || true
           files=()
-          for f in app/build/app/outputs/flutter-apk/*.apk "$RUNNER_TEMP/SHA256SUMS" "$RUNNER_TEMP/build-report.md" "$RUNNER_TEMP/apk-build.log"; do
+          for f in "$RUNNER_TEMP"/dist/*.apk "$RUNNER_TEMP"/dist/SHA256SUMS "$RUNNER_TEMP/build-report.md"; do
             [ -f "$f" ] && files+=("$f")
           done
           if [ ${#files[@]} -eq 0 ]; then echo "没有可发布的产物"; exit 0; fi
           gh release create "$TAG" \
-            --title "CI 最新构建（Debug）" \
+            --title "CI 最新构建（Debug / 含侧装包）" \
             --notes-file "$RUNNER_TEMP/build-report.md" \
             --prerelease \
             "${files[@]}"
