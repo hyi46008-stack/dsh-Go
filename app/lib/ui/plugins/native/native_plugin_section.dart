@@ -129,7 +129,8 @@ class NativePluginSection extends ConsumerWidget {
                 },
               ),
           // v1.2: whether it may hear the person speak (asked on first use).
-          if (plugin.native && plugin.capabilities.contains('voice'))
+          // `mic` listens too: the same switch governs its consent.
+          if (plugin.native && (plugin.capabilities.contains('voice') || plugin.capabilities.contains('mic')))
             Builder(
               builder: (context) {
                 final on = ref.watch(nativeVoiceConsentProvider)[NativeVoiceConsents.keyOf(host, package)] == true;

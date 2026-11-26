@@ -25,7 +25,7 @@ val sideBuild = providers.environmentVariable("DSH_SIDE_BUILD").orNull == "1"
 // P0 microphone test: default to .test2 so a side build can be installed next to an
 // already-installed .test build signed with a different debug key (the debug keystore is
 // per runner). Set DSH_SIDE_SUFFIX to override; revert this default after P0 validation.
-val sideSuffix = System.getenv("DSH_SIDE_SUFFIX")?.takeIf { it.startsWith(".") } ?: ".test2"
+val sideSuffix = System.getenv("DSH_SIDE_SUFFIX")?.takeIf { it.startsWith(".") } ?: ".test3"
 // Static shortcuts name their target package literally; a side build's release
 // resources get a copy naming its own (registered further down).
 abstract class SideShortcuts : DefaultTask() {

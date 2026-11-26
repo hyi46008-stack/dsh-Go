@@ -554,7 +554,11 @@ Future<bool> _invoke(
   // first, before anything starts playing.
   if (!guard.current) return false;
   bool? mayListen;
-  if (capabilityEffects.any((e) => e['type'] == 'voice' && e['op'] == 'start') && context.mounted) {
+  // `mic` uses the same consent as `voice`: both open the microphone, so a mic
+  // start asks (and honours the switch) exactly like a voice start.
+  final asksToListen = capabilityEffects.any((e) =>
+      (e['type'] == 'voice' && e['op'] == 'start') || (e['type'] == 'mic' && e['op'] == 'start'));
+  if (asksToListen && context.mounted) {
     mayListen = await askNativeVoiceConsent(context, ref, package);
     if (!guard.current) return false;
   }
