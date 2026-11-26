@@ -56,8 +56,8 @@ class VoicePlugin :
     private var recognizer: SpeechRecognizer? = null
     private var recognizerEnvironment: VoiceEnvironment? = null
     private var recorder: WavRecorder? = null
-    private var recognizerMic = 0
-    private var recorderMic = 0
+    private var recognizerMic: Int? = null
+    private var recorderMic: Int? = null
     private var releasingRecorders = 0
     private val afterRecorderRelease = ArrayList<() -> Unit>()
     private var generation = 0L
@@ -201,7 +201,17 @@ class VoicePlugin :
         }
         recognizer = created
         recognizerEnvironment = environment
-        recognizerMic = MicArbiter.beginDictation()
+        val mic = MicArbiter.beginDictation()
+        if (mic == null) {
+            // A plugin's recorder is still closing: refuse, never open a second one.
+            VoiceDiagnostics.failure(appContext, environment, 100, "start")
+            recognizer = null
+            recognizerEnvironment = null
+            runCatching { created.cancel() }
+            runCatching { created.destroy() }
+            return result.error("busy", "the microphone is still closing", mapOf("code" to 100))
+        }
+        recognizerMic = mic
         val intent = Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
             putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
             putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, true)
@@ -277,7 +287,8 @@ class VoicePlugin :
         val r = recognizer ?: return
         recognizer = null
         recognizerEnvironment = null
-        MicArbiter.endDictation(recognizerMic)
+        recognizerMic?.let { MicArbiter.endDictation(it) }
+        recognizerMic = null
         runCatching { r.cancel() }
         runCatching { r.destroy() }
     }
@@ -311,6 +322,12 @@ class VoicePlugin :
             } },
         )
         val mic = MicArbiter.beginDictation()
+        if (mic == null) {
+            // A plugin's recorder is still closing: refuse, never open a second one.
+            runCatching { r.discard() }
+            VoiceDiagnostics.failure(appContext, environment, 100, "start")
+            return result.error("busy", "the microphone is still closing", mapOf("code" to 100))
+        }
         val started = runCatching { r.start() }
         if (started.getOrDefault(false) != true) {
             releaseRecorder(mic, r::discard) {}
@@ -356,12 +373,12 @@ class VoicePlugin :
         }
     }
 
-    private fun <T> releaseRecorder(mic: Int, work: () -> T, finished: (Result<T>) -> Unit) {
+    private fun <T> releaseRecorder(mic: Int?, work: () -> T, finished: (Result<T>) -> Unit) {
         releasingRecorders++
         Thread {
             val outcome = runCatching(work)
             main.post {
-                MicArbiter.endDictation(mic)
+                mic?.let { MicArbiter.endDictation(it) }
                 releasingRecorders--
                 finished(outcome)
                 if (releasingRecorders == 0) {

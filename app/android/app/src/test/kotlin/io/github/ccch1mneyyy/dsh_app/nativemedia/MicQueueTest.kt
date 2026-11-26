@@ -7,7 +7,7 @@ import org.junit.Test
 
 /** v1.4 `mic`: the bounded hand-off must drop the oldest frame, never grow, never block. */
 class MicQueueTest {
-    private fun frame(seq: Int) = MicQueue.Frame(seq, ByteArray(640))
+    private fun frame(seq: Int, generation: Int = 1) = MicQueue.Frame(generation, seq, ByteArray(640))
 
     @Test
     fun aFullQueueDropsTheOldestFrame() {
@@ -36,11 +36,12 @@ class MicQueueTest {
     }
 
     @Test
-    fun framesKeepTheirBytesAndSeq() {
+    fun framesKeepTheirGenerationSeqAndBytes() {
         val q = MicQueue(2)
         val bytes = ByteArray(640) { 7 }
-        q.offer(MicQueue.Frame(42, bytes))
+        q.offer(MicQueue.Frame(3, 42, bytes))
         val got = q.take()
+        assertEquals(3, got?.generation)
         assertEquals(42, got?.seq)
         assertSame(bytes, got?.bytes)
     }

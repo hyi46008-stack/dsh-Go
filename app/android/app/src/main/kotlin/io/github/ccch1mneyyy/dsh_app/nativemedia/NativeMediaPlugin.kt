@@ -61,7 +61,7 @@ class NativeMediaPlugin :
     private var player: ClipPlayer? = null
     private var capture: VoiceCapture? = null
     // v1.4 `mic`: the same capture, without a gate, its frames going to Dart.
-    private var micActive = false
+    private val mic = MicSession()
     @Volatile private var micSeq = 0
     // Bounded hand-off capture → main thread; then a credit window limits what Dart has not
     // acknowledged, so a stalled consumer stops the producer instead of growing a buffer.
@@ -194,7 +194,8 @@ class NativeMediaPlugin :
                 overlays.hideCaption()
                 result.success(null)
             }
-            "disposeOwner" -> ok(result, disposeLocal(), "close")
+            // A recorder that is still closing is not a failure: the poller finishes it.
+            "disposeOwner" -> ok(result, disposeLocal() || mic.closing, "close")
             else -> result.notImplemented()
         }
     }
@@ -278,12 +279,14 @@ class NativeMediaPlugin :
     }
 
     private fun startVoice(o: Owner, result: MethodChannel.Result) {
-        micActive = false
         if (!onScreen()) return result.error("not-foreground", "the app is not on screen", null)
         if (!hasMicPermission()) return result.error("permission", "RECORD_AUDIO is not granted", null)
-        // A plugin's frame capture gives way to its own listening, and vice versa.
-        if (capture?.active == true && !framesMode) return result.success(null)
-        if (framesMode) capture?.stop()
+        // A plugin's frame capture gives way to its own listening, and vice versa. A capture that
+        // is still closing is waited for here: no second recorder while the first one lives.
+        if (capture?.active == true && !framesMode && !mic.closing) return result.success(null)
+        if ((framesMode || mic.closing) && !stopVoice()) {
+            return result.error("stopping", "the previous capture is still closing", null)
+        }
         if (!MicArbiter.acquire(micHolder)) return result.error("busy", "dictation is using the microphone", null)
         // The indicator first: no listening without it.
         if (!overlays.showIndicator(o.pluginTitle)) {
@@ -310,7 +313,9 @@ class NativeMediaPlugin :
     private fun startMic(o: Owner, result: MethodChannel.Result) {
         if (!onScreen()) return result.error("not-foreground", "the app is not on screen", null)
         if (!hasMicPermission()) return result.error("permission", "RECORD_AUDIO is not granted", null)
-        if (micActive) return result.success(null)
+        // A running or still-closing capture is ended first: frames from it belong to the old
+        // generation and must never be sent under this lease.
+        if (!stopVoice()) return result.error("stopping", "the previous capture is still closing", null)
         if (!MicArbiter.acquire(micHolder)) return result.error("busy", "dictation is using the microphone", null)
         if (!overlays.showIndicator(o.pluginTitle)) {
             MicArbiter.release(micHolder)
@@ -323,13 +328,16 @@ class NativeMediaPlugin :
             MicArbiter.release(micHolder)
             return result.error("stopping", "the previous capture is still closing", null)
         }
+        // Begin before the thread starts: the very first frame must carry this generation.
+        mic.begin()
         if (!c.start()) {
+            mic.stop(threadExited = true)
             overlays.hideIndicator()
             MicArbiter.release(micHolder)
             return result.error("capture", "the microphone could not be opened", null)
         }
-        micActive = true
-        micSeq = 0
+        // micSeq keeps increasing across captures and leases: the bridge drops a seq it already
+        // saw, so resetting it would silently discard every frame of the new capture.
         micQueue.clear()
         micCredits = MIC_WINDOW
         main.postDelayed(micPump, MIC_FRAME_MS)
@@ -349,16 +357,43 @@ class NativeMediaPlugin :
         else VoiceCapture(main, ::onSpeechEdge, ::onCaptureError)).also { capture = it; framesMode = frames }
     }
 
-    /** Stops listening; the indicator goes only once the microphone is closed. */
+    /**
+     * Stops listening. Frames stop at once; the arbiter and the indicator stay until the capture
+     * thread has really exited (the poller finishes the release). Returns true only when closed.
+     */
     private fun stopVoice(): Boolean {
-        micActive = false
         micQueue.clear()
         micCredits = 0
         main.removeCallbacks(micPump)
         val closed = capture?.stop() != false
+        if (mic.stop(closed)) {
+            main.removeCallbacks(closePoller)
+            releaseMicUi()
+        } else {
+            // Keep the arbiter and the indicator: the microphone may still be reading.
+            main.removeCallbacks(closePoller)
+            main.postDelayed(closePoller, CLOSE_POLL_MS)
+        }
+        return closed
+    }
+
+    /** Releases what the microphone owned; safe to call twice. */
+    private fun releaseMicUi() {
         MicArbiter.release(micHolder)
         overlays.hideIndicator()
-        return closed
+    }
+
+    /** Waits for a closing capture thread, then releases the arbiter and the indicator once. */
+    private val closePoller = object : Runnable {
+        override fun run() {
+            if (!mic.closing) return
+            val c = capture
+            if (c == null || !c.closing) {
+                if (mic.threadExited()) releaseMicUi()
+            } else {
+                main.postDelayed(this, CLOSE_POLL_MS)
+            }
+        }
     }
 
     private fun debugState(): String = "{owner=${owner?.generation}, player=${player?.active == true}, playing=${player?.playing == true}, " +
@@ -386,14 +421,17 @@ class NativeMediaPlugin :
 
     /** Capture thread: hand the frame to a bounded queue; never block, never allocate a task. */
     private fun onMicFrame(frame: ShortArray, count: Int) {
-        if (!micActive) return
-        micQueue.offer(MicQueue.Frame(++micSeq, MicPcm.bytes(frame, count)))
+        if (!mic.active) return
+        // Stamp the session the frame belongs to; a frame from an old session is filtered by
+        // the pump even if it was queued just before the stop.
+        val generation = mic.generation
+        micQueue.offer(MicQueue.Frame(generation, ++micSeq, MicPcm.bytes(frame, count)))
     }
 
     /** Main thread: send at most [MIC_PER_TICK] frames per tick while the credit window allows. */
     private val micPump = object : Runnable {
         override fun run() {
-            if (!micActive) return
+            if (!mic.active) return
             val o = owner
             val s = sink
             if (o == null || s == null) {
@@ -402,6 +440,8 @@ class NativeMediaPlugin :
                 var sent = 0
                 while (sent < MIC_PER_TICK && micCredits > 0) {
                     val frame = micQueue.take() ?: break
+                    // Frames of a previous session never reach the new lease.
+                    if (!mic.owns(frame.generation)) continue
                     micCredits--
                     s.success(
                         buildMap {
@@ -422,7 +462,7 @@ class NativeMediaPlugin :
 
     private fun onCaptureError(reason: String) {
         if (owner == null) return
-        val wasMic = micActive
+        val wasMic = mic.active
         stopVoice()
         emitCurrent(if (wasMic) "mic.error" else "voice.error", reason)
     }
@@ -442,7 +482,11 @@ class NativeMediaPlugin :
 
     // ---- ending --------------------------------------------------------------------------------
 
-    /** Frees everything of the current owner; true when the player and the microphone are closed. */
+    /**
+     * Frees everything of the current owner. Returns whether the microphone is already closed; a
+     * capture that is still closing is not a failure — its poller releases the arbiter and the
+     * indicator once the thread exits.
+     */
     private fun disposeLocal(): Boolean {
         val wasOwner = owner
         owner = null
@@ -451,16 +495,22 @@ class NativeMediaPlugin :
             pendingGrant = null
         }
         val playerClosed = player?.release() != false
-        val micClosed = stopVoice()
-        overlays.hideAll()
-        return playerClosed && micClosed
+        stopVoice()
+        // A closing recorder is not a failure: the poller releases it when the thread exits.
+        // The caption goes now; the listening indicator stays until the microphone is closed.
+        if (mic.closing) overlays.hideCaption() else overlays.hideAll()
+        return playerClosed
     }
 
-    /** Ends the current owner from this side and tells Dart (`owner.revoked`). */
-    private fun revoke(reason: String) {
-        val o = owner ?: return
-        disposeLocal()
+    /**
+     * Ends the current owner from this side and tells Dart (`owner.revoked`). Returns whether the
+     * microphone is already closed — the dictation arbiter needs the real answer.
+     */
+    private fun revoke(reason: String): Boolean {
+        val o = owner ?: return true
+        val micClosed = disposeLocal()
         emit(o, "owner.revoked", reason)
+        return micClosed
     }
 
     private fun emitCurrent(kind: String, reason: String? = null, localStopped: Boolean = false) {
@@ -500,6 +550,7 @@ class NativeMediaPlugin :
         const val MIC_WINDOW = 16
         const val MIC_PER_TICK = 4
         const val MIC_FRAME_MS = 20L
+        const val CLOSE_POLL_MS = 100L
         const val MAX_TITLE = 24
         const val MAX_CAPTION_CHARS = 240
         const val MAX_CAPTION_BYTES = 1024

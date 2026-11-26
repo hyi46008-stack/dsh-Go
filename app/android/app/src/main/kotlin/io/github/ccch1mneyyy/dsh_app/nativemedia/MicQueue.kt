@@ -9,7 +9,7 @@ package io.github.ccch1mneyyy.dsh_app.nativemedia
  * Main and capture threads share it; every method is synchronized on the queue.
  */
 class MicQueue(private val capacity: Int = 8) {
-    class Frame(val seq: Int, val bytes: ByteArray)
+    class Frame(val generation: Int, val seq: Int, val bytes: ByteArray)
 
     private val items = ArrayDeque<Frame>(capacity)
 
