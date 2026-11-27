@@ -38,6 +38,18 @@ class WakeWordService {
     }
   }
 
+  /// 识别结果是否算喊中。
+  ///
+  /// 手机上的流式模型是双语小模型，实测把「小黄鱼」听成「小王于 / 王完渝」这种同音近字，
+  /// 所以除了原字面，还收下这几种常见混淆。
+  static bool matches(String heard) {
+    final text = heard.replaceAll(RegExp(r'[\s，。！？、,.!?]'), '');
+    if (text.contains(defaultKeyword)) return true;
+    if (RegExp(r'[小晓肖筱萧笑][黄王汪皇完望旺璜][鱼于余渝宇育预]').hasMatch(text)) return true;
+    if (RegExp(r'[小晓肖筱萧笑][黄王汪皇完望旺璜]').hasMatch(text)) return true;
+    return text.toLowerCase().contains('xiaohuang');
+  }
+
   /// 挂起前台服务（不采集，只是让进程在后台活着并有通知）。
   static Future<void> start() async {
     if (_started) return;

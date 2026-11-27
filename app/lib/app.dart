@@ -180,7 +180,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
 
   void _onWakeWords(String words) {
     if (words.isNotEmpty) debugPrint('wake: heard "$words"');
-    if (!words.contains(WakeWordService.defaultKeyword)) return;
+    if (!WakeWordService.matches(words)) return;
     if (_wakePending) return;
     _wakePending = true;
     unawaited(_stopWakeListening());
