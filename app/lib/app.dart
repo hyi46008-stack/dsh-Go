@@ -17,6 +17,7 @@ import 'performance/performance_state.dart';
 import 'performance/refresh_rate.dart';
 import 'remote/remote_background.dart';
 import 'speech/wake/wake_word.dart';
+import 'state/voice_state.dart' show voiceBridgeProvider;
 import 'ui/chat/voice/voice_bridge.dart';
 import 'state/app_info.dart';
 import 'state/appearance_state.dart';
