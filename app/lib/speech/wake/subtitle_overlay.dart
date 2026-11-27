@@ -1,3 +1,4 @@
+import 'package:flutter/foundation.dart';
 import 'package:flutter/services.dart';
 
 /// 「小黄鱼」后台免提时的字幕悬浮条（原生悬浮窗，见 voice/SubtitleOverlay.kt）。
@@ -21,7 +22,9 @@ class WakeSubtitles {
     _last = text;
     try {
       await _channel.invokeMethod<void>('show', {'text': text});
-    } catch (_) {}
+    } catch (error) {
+      debugPrint('subtitle: show failed $error');
+    }
   }
 
   static Future<void> update(String text) async {
@@ -36,6 +39,8 @@ class WakeSubtitles {
     _last = '';
     try {
       await _channel.invokeMethod<void>('hide');
-    } catch (_) {}
+    } catch (error) {
+      debugPrint('subtitle: hide failed $error');
+    }
   }
 }

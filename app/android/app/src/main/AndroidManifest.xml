@@ -449,6 +449,15 @@
             android:name="com.google.mlkit.common.internal.MlKitInitProvider"
             android:authorities="${applicationId}.mlkitinitprovider"
             tools:node="remove" />
+        <receiver
+            android:name=".voice.DebugSubtitleReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="io.github.ccch1mneyyy.dsh_app.DEBUG_SUBTITLE" />
+                <action android:name="io.github.ccch1mneyyy.dsh_app.DEBUG_SUBTITLE_HIDE" />
+            </intent-filter>
+        </receiver>
+
     </application>
     <!-- Required to query activities that can process text, see:
          https://developer.android.com/training/package-visibility and
