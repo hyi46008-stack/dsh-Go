@@ -110,6 +110,8 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     super.didChangeAppLifecycleState(state);
     // 前台：听写和通话要麦克风，唤醒先让开；后台：用本地语音模型听唤醒词。
     if (state == AppLifecycleState.resumed) {
+      _wakeWatchdog?.cancel();
+      _wakeWatchdog = null;
       unawaited(_stopWakeListening());
       if (_wakePending) {
         _wakePending = false;
@@ -185,6 +187,25 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     _wakePending = true;
     unawaited(_stopWakeListening());
     unawaited(WakeWordService.bringToFront());
+    _armWakeResumeWatchdog(attempt: 1);
+  }
+
+  /// 喊中之后等「回到前台」；系统把拉起拦掉时（国产 ROM 的后台弹出限制），
+  /// 不能就这么一直哑着——重试一次，还不行就把麦克风重新打开继续听。
+  void _armWakeResumeWatchdog({required int attempt}) {
+    _wakeWatchdog?.cancel();
+    _wakeWatchdog = Timer(const Duration(seconds: 5), () {
+      if (!_wakePending) return;
+      if (attempt < 2) {
+        debugPrint('wake: not resumed, retry bringToFront ($attempt)');
+        unawaited(WakeWordService.bringToFront());
+        _armWakeResumeWatchdog(attempt: attempt + 1);
+        return;
+      }
+      debugPrint('wake: resume never happened, resume listening');
+      _wakePending = false;
+      unawaited(_beginWakeListening());
+    });
   }
 
   @override
@@ -196,6 +217,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   /// 后台听唤醒词时那一轮本地识别；喊中或回到前台就收掉。
   LiveWords? _wakeWords;
   bool _wakePending = false;
+  Timer? _wakeWatchdog;
   VoiceBridge? _wakeBridge;
   StreamSubscription<VoiceEvent>? _wakeEvents;
 
