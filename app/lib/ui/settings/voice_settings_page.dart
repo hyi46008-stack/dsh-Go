@@ -13,6 +13,7 @@ import '../../state/streaming_asr_state.dart' show SystemAsrReadiness, ohosStrea
 import '../../state/voice_model_state.dart';
 import '../../state/voice_settings.dart';
 import '../../state/voice_state.dart';
+import '../../state/xiaohuangyu_state.dart';
 import '../common/app_dialog.dart';
 import '../companion/companion_voice_page.dart';
 import '../providers/provider_widgets.dart';
@@ -132,6 +133,7 @@ class _VoiceSettingsPageState extends ConsumerState<VoiceSettingsPage> {
     final languages = ohos ? ref.watch(voiceCapabilitiesProvider).value?.languages : null;
     final chineseOnly = languages != null && languages.isNotEmpty && languages.every((l) => l.startsWith('zh'));
     final call = ref.watch(callSettingsProvider);
+    final xhy = ref.watch(xiaohuangyuProvider);
     final calls = ref.read(callSettingsProvider.notifier);
     return AppPage.list(
       title: l10n.voiceSettingsTitle,
@@ -202,6 +204,26 @@ class _VoiceSettingsPageState extends ConsumerState<VoiceSettingsPage> {
             // HarmonyOS captions use its own recognizer: nothing to download.
             children: [ohos ? const SystemAsrCard() : const StreamingAsrModelCard()],
           ),
+        SettingsSection(
+          title: '小黄鱼',
+          footer: const Text('唤醒词在后台用本地语音模型听，录音不出手机。'),
+          children: [
+            SettingsSwitchTile(
+              key: const ValueKey('xiaohuangyu-background-talk'),
+              title: '后台免提对话',
+              subtitle: '喊中「小黄鱼」之后不打开通话页，直接在后台继续听，把听到的话打到字幕条上；说「退下」结束。',
+              value: xhy.backgroundTalk,
+              onChanged: (on) => unawaited(ref.read(xiaohuangyuProvider.notifier).setBackgroundTalk(on)),
+            ),
+            SettingsSwitchTile(
+              key: const ValueKey('xiaohuangyu-subtitles'),
+              title: '字幕悬浮条',
+              subtitle: '把听到的话显示在屏幕底部的发光字幕条上，可随时关掉。',
+              value: xhy.subtitles,
+              onChanged: (on) => unawaited(ref.read(xiaohuangyuProvider.notifier).setSubtitles(on)),
+            ),
+          ],
+        ),
         SettingsSection(
           title: l10n.speechCallSection,
           footer: Text(l10n.speechCallFooter),

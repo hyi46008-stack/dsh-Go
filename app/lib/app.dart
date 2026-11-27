@@ -16,7 +16,9 @@ import 'l10n/l10n.dart';
 import 'performance/performance_state.dart';
 import 'performance/refresh_rate.dart';
 import 'remote/remote_background.dart';
+import 'speech/wake/subtitle_overlay.dart';
 import 'speech/wake/wake_word.dart';
+import 'state/xiaohuangyu_state.dart' show xiaohuangyuProvider;
 import 'state/voice_state.dart' show voiceBridgeProvider;
 import 'ui/chat/voice/voice_bridge.dart';
 import 'state/app_info.dart';
@@ -112,6 +114,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     if (state == AppLifecycleState.resumed) {
       _wakeWatchdog?.cancel();
       _wakeWatchdog = null;
+      if (_bgTalkActive) unawaited(_stopBackgroundTalk());
       unawaited(_stopWakeListening());
       if (_wakePending) {
         _wakePending = false;
@@ -186,8 +189,111 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     if (_wakePending) return;
     _wakePending = true;
     unawaited(_stopWakeListening());
+    // 默认「后台免提」：喊中之后不出画面，就在后台继续听，把话打到字幕条上。
+    if (ref.read(xiaohuangyuProvider).backgroundTalk) {
+      unawaited(_startBackgroundTalk());
+      return;
+    }
     unawaited(WakeWordService.bringToFront());
     _armWakeResumeWatchdog(attempt: 1);
+  }
+
+  // ── 后台免提：唤醒后不出界面，继续在后台听 ──────────────────────────────
+
+  bool _bgTalkActive = false;
+  Timer? _bgTalkIdle;
+  LiveWords? _bgTalkLive;
+  VoiceBridge? _bgTalkBridge;
+  StreamSubscription<VoiceEvent>? _bgTalkEvents;
+
+  /// 说这些词就结束后台免提。
+  static const List<String> _bgTalkStopPhrases = ['退下', '结束', '别听了', '再见小黄鱼', '不聊了'];
+
+  Future<void> _startBackgroundTalk() async {
+    if (_bgTalkActive) return;
+    _bgTalkActive = true;
+    final subs = ref.read(xiaohuangyuProvider).subtitles;
+    debugPrint('wake: background talk start (subtitles=$subs)');
+    if (subs) unawaited(WakeSubtitles.show('小黄鱼在听…'));
+    try {
+      final bridge = ref.read(voiceBridgeProvider);
+      await bridge.startRecorder(maxSeconds: 300);
+      _bgTalkBridge = bridge;
+      _bgTalkEvents = bridge.events.listen((event) {
+        if (event is VoiceLimit || event is VoiceEnd) {
+          unawaited(bridge.startRecorder(maxSeconds: 300).catchError((Object _) {}));
+        }
+      });
+      final chosen = await liveWordsModel(ref);
+      if (chosen == null) {
+        debugPrint('wake: background talk has no model');
+        await _stopBackgroundTalk();
+        return;
+      }
+      final live = LiveWords(
+        ref.read(streamingPcmCaptureProvider),
+        ref.read(streamingAsrProvider),
+        chosen.model,
+        StreamingPcmSource.dictation,
+        (heard) => _onBackgroundTalkWords(heard, subs),
+        trial: chosen.trial,
+        onFailure: (Object error) {
+          debugPrint('wake: background talk failed $error');
+          unawaited(_stopBackgroundTalk());
+        },
+      );
+      await live.start();
+      _bgTalkLive = live;
+      _bgTalkTouch();
+      debugPrint('wake: background talk listening');
+    } catch (error) {
+      debugPrint('wake: background talk start failed $error');
+      await _stopBackgroundTalk();
+    }
+  }
+
+  void _onBackgroundTalkWords(String words, bool subs) {
+    if (words.isEmpty) return;
+    _bgTalkTouch();
+    debugPrint('bg talk: heard "$words"');
+    for (final phrase in _bgTalkStopPhrases) {
+      if (words.contains(phrase)) {
+        unawaited(_stopBackgroundTalk());
+        return;
+      }
+    }
+    if (subs) unawaited(WakeSubtitles.update(words));
+  }
+
+  /// 一段时间没人说话就自动收工，别一直占着麦克风。
+  void _bgTalkTouch() {
+    _bgTalkIdle?.cancel();
+    _bgTalkIdle = Timer(const Duration(seconds: 45), () => unawaited(_stopBackgroundTalk()));
+  }
+
+  Future<void> _stopBackgroundTalk() async {
+    if (!_bgTalkActive) return;
+    _bgTalkActive = false;
+    _bgTalkIdle?.cancel();
+    _bgTalkIdle = null;
+    unawaited(_bgTalkEvents?.cancel());
+    _bgTalkEvents = null;
+    final bridge = _bgTalkBridge;
+    _bgTalkBridge = null;
+    if (bridge != null) unawaited(bridge.cancel().catchError((Object _) {}));
+    final live = _bgTalkLive;
+    _bgTalkLive = null;
+    if (live != null) {
+      try {
+        await live.stop();
+      } catch (_) {}
+    }
+    unawaited(WakeSubtitles.hide());
+    _wakePending = false;
+    debugPrint('wake: background talk end');
+    if (WidgetsBinding.instance.lifecycleState != AppLifecycleState.resumed) {
+      unawaited(_beginWakeListening());
+    }
   }
 
   /// 喊中之后等「回到前台」；系统把拉起拦掉时（国产 ROM 的后台弹出限制），
