@@ -8,6 +8,7 @@ import android.graphics.drawable.GradientDrawable
 import android.os.Build
 import android.os.Handler
 import android.os.Looper
+import android.util.Log
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.View
@@ -48,13 +49,14 @@ object SubtitleOverlay {
                     setStroke(dp(ctx, 1), Color.parseColor("#8000E5FF"))
                 }
                 maxLines = 4
-                visibility = View.GONE
+                // 先给一句占位字：wrap_content 的窗口要有内容才有高度，否则显示时会量成 0。
+                text = "小黄鱼在听…"
+                visibility = View.VISIBLE
                 alpha = 0f
             }
             val frame = FrameLayout(ctx).apply {
                 setPadding(dp(ctx, 18), 0, dp(ctx, 18), 0)
                 addView(text, FrameLayout.LayoutParams(FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
-                visibility = View.GONE
                 alpha = 0f
             }
             val wm = ctx.getSystemService(Context.WINDOW_SERVICE) as WindowManager
@@ -79,6 +81,7 @@ object SubtitleOverlay {
             wm.addView(frame, lp)
             root = frame
             label = text
+            Log.i("DshSubtitle", "overlay added")
             text
         }.getOrNull()
     }
@@ -87,31 +90,28 @@ object SubtitleOverlay {
         val view = ensure(context) ?: return@post
         view.text = text
         val frame = root ?: return@post
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.HONEYCOMB) {
-            frame.animate().cancel()
-            frame.visibility = View.VISIBLE
-            frame.translationY = dp(context, 26).toFloat()
-            frame.animate().alpha(1f).translationY(0f).setDuration(220).start()
-        } else {
-            frame.alpha = 1f
-        }
+        Log.i("DshSubtitle", "show: " + text)
+        frame.animate().cancel()
+        frame.translationY = dp(context, 26).toFloat()
+        frame.animate().alpha(1f).translationY(0f).setDuration(220).start()
     }
 
     fun update(context: Context, text: String) = main.post {
         val view = label ?: return@post
         if (view.text.toString() == text) return@post
         view.text = text
-        if (root?.visibility != View.VISIBLE) show(context, text)
+        val frame = root ?: return@post
+        if (frame.alpha < 1f) {
+            frame.animate().cancel()
+            frame.animate().alpha(1f).setDuration(160).start()
+        }
     }
 
     fun hide() = main.post {
         val frame = root ?: return@post
         frame.animate().cancel()
         frame.animate().alpha(0f).translationY(dp(frame.context, 26).toFloat()).setDuration(200)
-            .withEndAction {
-                frame.visibility = View.GONE
-                frame.alpha = 0f
-            }
+            .withEndAction { frame.alpha = 0f }
             .start()
     }
 }
