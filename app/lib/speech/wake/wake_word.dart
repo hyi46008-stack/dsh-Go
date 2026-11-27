@@ -37,6 +37,7 @@ class WakeWordService {
     if (_started) return;
     try {
       await _listen();
+      await _ensureMicrophone();
       await _methods.invokeMethod<void>('start', {'keyword': keyword});
       _started = true;
     } catch (_) {
@@ -70,6 +71,18 @@ class WakeWordService {
     try {
       await _methods.invokeMethod<void>('stop');
     } catch (_) {}
+  }
+
+  /// 没有麦克风权限时问一次（系统弹窗）；用户拒绝就静默跳过。
+  static Future<void> _ensureMicrophone() async {
+    try {
+      final voice = const MethodChannel('dsh/voice');
+      final state = await voice.invokeMethod<String>('permission');
+      if (state == 'granted') return;
+      await voice.invokeMethod<String>('requestPermission');
+    } catch (_) {
+      // 老版本 App 没有这个通道：交给服务自己判断。
+    }
   }
 
   static Future<void> _listen() async {
