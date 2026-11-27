@@ -79,6 +79,7 @@ class MainActivity : FlutterActivity() {
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) window.setDecorFitsSystemWindows(false)
         current = WeakReference(this)
+        applyWakeScreenOn(intent)
         // After LaunchScreen read what this launch's splash showed: the next ones show the icon
         // (and launch screen) chosen now (Android 13+).
         LaunchThemeSync.sync(this)
@@ -267,7 +268,27 @@ class MainActivity : FlutterActivity() {
     /** Flutter produced a frame recently (see RefreshRateService): auto mode follows it. */
     private var framesActive = true
 
+    /// 唤醒把 App 叫回来时（语音唤醒的 startActivity 带着 EXTRA_WAKE），
+    /// 熄屏要亮起来、锁屏要能盖上去 —— 否则人喊完只看到锁屏。
+    private fun applyWakeScreenOn(intent: Intent?) {
+        if (intent?.getBooleanExtra(EXTRA_WAKE, false) != true) return
+        intent.removeExtra(EXTRA_WAKE)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+        }
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        // App 在后台时唤醒走的是这里（singleTop），onCreate 不会再跑。
+        super.onNewIntent(intent)
+        applyWakeScreenOn(intent)
+    }
+
     companion object {
+        /// 语音唤醒的「把我叫醒」标记，见 WakeWordService.bringToFront。
+        const val EXTRA_WAKE = "dsh_wake"
+
         private const val ENGINE_ID = "dsh-main"
         private const val CALENDAR_PERMISSION_REQUEST = 441
 

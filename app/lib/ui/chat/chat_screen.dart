@@ -1491,10 +1491,13 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
     showUsageSheet(context, sessionId: sessionId, model: model);
   }
 
-  /// 小黄鱼唤醒：只有当前在最前面的对话接住这次唤醒。
+  /// 小黄鱼唤醒：不管现在停在哪个页面，喊中就直接进语音通话。
+  ///
+  /// 原来要求「对话页在最前面」，于是停在设置 / 对话列表时被唤醒只会回到前台、
+  /// 不开通话。这个对话页是 HomeShell 的主体，压在别的页面下面时仍然挂在树上，
+  /// 所以这里不看 isCurrent，直接把通话页盖上去。
   bool _onWakeWord(String heard) {
     if (!mounted) return false;
-    if (ModalRoute.of(context)?.isCurrent != true) return false;
     _callFromHeader();
     return true;
   }
