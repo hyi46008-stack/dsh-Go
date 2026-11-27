@@ -17,6 +17,7 @@ import 'performance/performance_state.dart';
 import 'performance/refresh_rate.dart';
 import 'remote/remote_background.dart';
 import 'speech/wake/wake_word.dart';
+import 'ui/chat/voice/voice_bridge.dart';
 import 'state/app_info.dart';
 import 'state/appearance_state.dart';
 import 'state/locale_state.dart';
@@ -123,6 +124,11 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   Future<void> _beginWakeListening() async {
     if (_wakeWords != null) return;
     try {
+      // 本地识别要的是录音机的 PCM 流：不先开录音，识别永远收不到声音。
+      final bridge = ref.read(voiceBridgeProvider);
+      await bridge.startRecorder(maxSeconds: 600);
+      _wakeBridge = bridge;
+      _wakeEvents = bridge.events.listen(_onWakeVoiceEvent);
       final chosen = await liveWordsModel(ref);
       debugPrint('wake: model=${chosen == null ? 'none' : (chosen.model.isSystem ? 'system' : 'local')}');
       if (chosen == null) return;
@@ -142,17 +148,33 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     } catch (error) {
       // 模型没就绪、麦克风被别的应用占着：这一轮就不听，回到前台再算。
       debugPrint('wake: start failed $error');
+      unawaited(_stopWakeListening());
     }
   }
 
   Future<void> _stopWakeListening() async {
     final live = _wakeWords;
     _wakeWords = null;
+    unawaited(_wakeEvents?.cancel());
+    _wakeEvents = null;
+    final bridge = _wakeBridge;
+    _wakeBridge = null;
+    if (bridge != null) unawaited(bridge.cancel().catchError((Object _) {}));
     unawaited(WakeWordService.pause());
     if (live == null) return;
     try {
       await live.stop();
     } catch (_) {}
+  }
+
+  /// 引擎的录音一轮最多 600 秒；到点后重开一轮，后台继续听。
+  void _onWakeVoiceEvent(VoiceEvent event) {
+    if (_wakeWords == null) return;
+    if (event is VoiceLimit || event is VoiceEnd) {
+      final bridge = _wakeBridge;
+      if (bridge == null) return;
+      unawaited(bridge.startRecorder(maxSeconds: 600).catchError((Object _) {}));
+    }
   }
 
   void _onWakeWords(String words) {
@@ -173,6 +195,8 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   /// 后台听唤醒词时那一轮本地识别；喊中或回到前台就收掉。
   LiveWords? _wakeWords;
   bool _wakePending = false;
+  VoiceBridge? _wakeBridge;
+  StreamSubscription<VoiceEvent>? _wakeEvents;
 
   /// 跟随系统: the system language changed while the app was open.
   @override
