@@ -99,9 +99,9 @@ class WakeWordService : Service() {
                 val wanted = intent.getStringExtra(EXTRA_KEYWORD)
                 if (!wanted.isNullOrBlank()) keyword = wanted
                 running = true
-                paused = false
-                begin()
-                notify(getString(R.string.wake_word_notification_listening, keyword))
+                // 启动时 App 就在前台：先让麦，等退到后台再由 Dart 叫醒它。
+                paused = true
+                notify(getString(R.string.wake_word_notification_paused))
             }
         }
         return START_STICKY
@@ -223,7 +223,13 @@ class WakeWordService : Service() {
             .setContentTitle(getString(R.string.wake_word_notification_title))
             .setContentText(text ?: getString(R.string.wake_word_notification_listening, keyword))
             .setContentIntent(open)
-            .addAction(Notification.Action.Builder(null, getString(R.string.wake_word_notification_stop), stop).build())
+            .addAction(
+                Notification.Action.Builder(
+                    android.graphics.drawable.Icon.createWithResource(this, android.R.drawable.ic_media_pause),
+                    getString(R.string.wake_word_notification_stop),
+                    stop,
+                ).build(),
+            )
             .setOngoing(true)
             .setShowWhen(false)
             .build()
