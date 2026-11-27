@@ -34,6 +34,7 @@ object DshFlutterEngine {
             engine.plugins.add(LinksPlugin())
             engine.plugins.add(UpdatePlugin())
             engine.plugins.add(VoicePlugin())
+            engine.plugins.add(io.github.ccch1mneyyy.dsh_app.voice.WakeWordPlugin())
             engine.plugins.add(SharePlugin())
             engine.plugins.add(ShortcutsPlugin())
             engine.plugins.add(io.github.ccch1mneyyy.dsh_app.diagnostics.DiagnosticsPlugin())

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="wake_word_channel_name">Voice wake word</string>
+    <string name="wake_word_notification_title">DSH Go · listening for the wake word</string>
+    <string name="wake_word_notification_listening">Listening for “%1$s” while the app is in the background</string>
+    <string name="wake_word_notification_paused">Paused while the app is in the foreground</string>
+    <string name="wake_word_notification_heard">Heard “%1$s”</string>
+    <string name="wake_word_notification_stop">Stop</string>
+    <string name="wake_word_notification_no_permission">Microphone permission is missing</string>
+    <string name="wake_word_notification_unavailable">No speech recognizer is available on this phone</string>
+</resources>

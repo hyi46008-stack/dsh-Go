@@ -16,6 +16,7 @@ import 'l10n/l10n.dart';
 import 'performance/performance_state.dart';
 import 'performance/refresh_rate.dart';
 import 'remote/remote_background.dart';
+import 'speech/wake/wake_word.dart';
 import 'state/app_info.dart';
 import 'state/appearance_state.dart';
 import 'state/locale_state.dart';
@@ -92,6 +93,20 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     // while it is actually drawing (see RefreshRateService).
     RefreshRateService.instance.start();
     WidgetsBinding.instance.addObserver(this);
+    // 小黄鱼语音唤醒：App 在后台时听唤醒词，喊中就拉回前台开始通话。
+    // 失败（没有原生通道）时静默跳过。
+    unawaited(WakeWordService.start());
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    super.didChangeAppLifecycleState(state);
+    // 前台：听写和通话要麦克风，唤醒先让开；后台：轮到你听唤醒词。
+    if (state == AppLifecycleState.resumed) {
+      unawaited(WakeWordService.pause());
+    } else if (state == AppLifecycleState.paused) {
+      unawaited(WakeWordService.resume());
+    }
   }
 
   @override

@@ -13,6 +13,7 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../../speech/wake/wake_word.dart';
 import '../../l10n/l10n.dart';
 import '../../notify/chat_alerts.dart' show approvalText, questionText;
 import '../../runtime/local_footprint.dart' show RuntimeMissing;
@@ -370,6 +371,8 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
   void initState() {
     super.initState();
     WidgetsBinding.instance.addObserver(this);
+    // 喊中「小黄鱼」→ 这一页如果在最前面，就来一通语音通话。
+    WakeWordService.addHandler(_onWakeWord);
     _scheduleInteraction();
     ref.listenManual(currentSessionProvider, (_, _) => _scheduleInteraction());
     _voice = VoiceInputController(
@@ -538,6 +541,7 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
 
   @override
   void dispose() {
+    WakeWordService.removeHandler(_onWakeWord);
     _toTop?.dispose();
     _dropPreparedPhoneSkill();
     WidgetsBinding.instance.removeObserver(this);
@@ -1485,6 +1489,14 @@ class _ChatScreenState extends ConsumerState<ChatScreen> with WidgetsBindingObse
 
   void _openUsage(String sessionId, ModelSelection? model) {
     showUsageSheet(context, sessionId: sessionId, model: model);
+  }
+
+  /// 小黄鱼唤醒：只有当前在最前面的对话接住这次唤醒。
+  bool _onWakeWord(String heard) {
+    if (!mounted) return false;
+    if (ModalRoute.of(context)?.isCurrent != true) return false;
+    _callFromHeader();
+    return true;
   }
 
   /// The header's 语音通话 key: a call with the conversation on screen.

@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="wake_word_channel_name">语音唤醒</string>
+    <string name="wake_word_notification_title">DSH Go · 正在听唤醒词</string>
+    <string name="wake_word_notification_listening">App 在后台时听“%1$s”</string>
+    <string name="wake_word_notification_paused">App 在前台，已让出麦克风</string>
+    <string name="wake_word_notification_heard">听到“%1$s”了</string>
+    <string name="wake_word_notification_stop">停止</string>
+    <string name="wake_word_notification_no_permission">缺少麦克风权限</string>
+    <string name="wake_word_notification_unavailable">这台手机没有可用的语音识别服务</string>
+</resources>
