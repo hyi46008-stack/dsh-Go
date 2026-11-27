@@ -187,8 +187,8 @@ jobs:
               echo ""
               echo "### 失败摘要（已脱敏路径）"
               echo '```'
-              grep -hiE "error|failed|FAILURE|Exception" "$RUNNER_TEMP/apk-build.log" "$RUNNER_TEMP/apk-build-side.log" 2>/dev/null \
-                | sed -E "s#$RUNNER_TEMP#<tmp>#g; s#$GITHUB_WORKSPACE#<ws>#g" | tail -20 || true
+              grep -hiE "^(e|w): |error|failed|FAILURE|Exception" "$RUNNER_TEMP/apk-build.log" "$RUNNER_TEMP/apk-build-side.log" 2>/dev/null \
+                | sed -E "s#$RUNNER_TEMP#<tmp>#g; s#$GITHUB_WORKSPACE#<ws>#g" | tail -40 || true
               echo '```'
             fi
           } > "$RUNNER_TEMP/build-report.md"

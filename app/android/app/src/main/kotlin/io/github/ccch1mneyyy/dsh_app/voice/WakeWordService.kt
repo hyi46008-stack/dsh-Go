@@ -26,12 +26,13 @@ class WakeWordService : Service() {
         const val ACTION_STOP = "dsh.wake.stop"
         const val ACTION_LISTENING = "dsh.wake.listening"
         const val ACTION_IDLE = "dsh.wake.idle"
+        const val ACTION_PAUSE = "dsh.wake.pause"
+        const val ACTION_RESUME = "dsh.wake.resume"
 
         private const val CHANNEL_ID = "dsh_wake_word"
         private const val NOTIFICATION_ID = 4711
 
         @Volatile var running = false
-            private set
 
         fun start(context: Context) {
             val intent = Intent(context, WakeWordService::class.java).setAction(ACTION_START)
@@ -78,9 +79,14 @@ class WakeWordService : Service() {
                 listening = true
                 notify(getString(R.string.wake_word_notification_listening, "小黄鱼"))
             }
-            ACTION_IDLE -> {
+            ACTION_IDLE, ACTION_PAUSE -> {
                 listening = false
                 notify(getString(R.string.wake_word_notification_paused))
+            }
+            ACTION_RESUME -> {
+                running = true
+                listening = true
+                notify(getString(R.string.wake_word_notification_listening, "小黄鱼"))
             }
             else -> {
                 running = true
