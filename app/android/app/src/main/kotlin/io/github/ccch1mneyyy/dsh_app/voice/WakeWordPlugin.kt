@@ -24,15 +24,9 @@ class WakeWordPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
         context = ctx
         methods = MethodChannel(binding.binaryMessenger, "dsh/wake").also { it.setMethodCallHandler(this) }
         events = EventChannel(binding.binaryMessenger, "dsh/wake/events").also { it.setStreamHandler(this) }
-        WakeWordService.onWake = { heard ->
-            sink?.let { s ->
-                main.post { runCatching { s.success(mapOf("type" to "wake", "text" to heard)) } }
-            }
-        }
     }
 
     override fun onDetachedFromEngine(binding: FlutterPlugin.FlutterPluginBinding) {
-        WakeWordService.onWake = null
         methods?.setMethodCallHandler(null)
         methods = null
         events?.setStreamHandler(null)
@@ -58,8 +52,19 @@ class WakeWordPlugin : FlutterPlugin, MethodChannel.MethodCallHandler, EventChan
         }
         when (call.method) {
             "start" -> {
-                val keyword = call.argument<String>("keyword")?.takeIf { it.isNotBlank() } ?: "小黄鱼"
-                WakeWordService.start(ctx, keyword)
+                WakeWordService.start(ctx)
+                result.success(true)
+            }
+            "bringToFront" -> {
+                WakeWordService.bringToFront(ctx)
+                result.success(true)
+            }
+            "listening" -> {
+                WakeWordService.send(ctx, WakeWordService.ACTION_LISTENING)
+                result.success(true)
+            }
+            "idle" -> {
+                WakeWordService.send(ctx, WakeWordService.ACTION_IDLE)
                 result.success(true)
             }
             "stop" -> {

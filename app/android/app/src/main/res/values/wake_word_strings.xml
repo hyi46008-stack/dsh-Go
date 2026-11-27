@@ -8,4 +8,5 @@
     <string name="wake_word_notification_stop">Stop</string>
     <string name="wake_word_notification_no_permission">Microphone permission is missing</string>
     <string name="wake_word_notification_unavailable">No speech recognizer is available on this phone</string>
+    <string name="wake_word_notification_idle">Waiting in the background for “小黄鱼”</string>
 </resources>

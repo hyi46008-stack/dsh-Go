@@ -22,6 +22,8 @@ import 'state/appearance_state.dart';
 import 'state/locale_state.dart';
 import 'state/notify_state.dart' show notifyChannelProvider;
 import 'state/star_prompt.dart' show starPromptGateProvider, starPromptProvider;
+import 'state/streaming_asr_state.dart';
+import 'state/streaming_pcm_state.dart';
 import 'state/tile_style_state.dart';
 import 'ui/chat/dsh_ui/dsh_ui_model.dart' show DshUiAppAccent;
 import 'ui/chat/run_info.dart' show runActivityProvider;
@@ -32,6 +34,9 @@ import 'ui/shell/root_gate.dart';
 import 'ui/theme/theme.dart';
 import 'ui_config/ui_config_state.dart';
 import 'usage/usage_stats.dart';
+import 'voice/live_words.dart';
+import 'voice/live_words_model.dart';
+import 'voice/streaming_pcm.dart';
 
 class DshApp extends ConsumerStatefulWidget {
   const DshApp({super.key, this.home});
@@ -101,12 +106,58 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
     super.didChangeAppLifecycleState(state);
-    // 前台：听写和通话要麦克风，唤醒先让开；后台：轮到你听唤醒词。
+    // 前台：听写和通话要麦克风，唤醒先让开；后台：用本地语音模型听唤醒词。
     if (state == AppLifecycleState.resumed) {
-      unawaited(WakeWordService.pause());
+      unawaited(_stopWakeListening());
+      if (_wakePending) {
+        _wakePending = false;
+        // 等这一帧把界面立起来，再把唤醒交给最前面的对话（它会开语音通话）。
+        WidgetsBinding.instance.addPostFrameCallback((_) => WakeWordService.fireHandlers(WakeWordService.defaultKeyword));
+      }
     } else if (state == AppLifecycleState.paused) {
-      unawaited(WakeWordService.resume());
+      unawaited(_beginWakeListening());
     }
+  }
+
+  /// 退到后台：开一轮本地识别，听到「小黄鱼」就把 App 拉回来。
+  Future<void> _beginWakeListening() async {
+    if (_wakeWords != null) return;
+    try {
+      final chosen = await liveWordsModel(ref);
+      if (chosen == null) return;
+      final live = LiveWords(
+        ref.read(streamingPcmCaptureProvider),
+        ref.read(streamingAsrProvider),
+        chosen.model,
+        StreamingPcmSource.dictation,
+        _onWakeWords,
+        trial: chosen.trial,
+        onFailure: (Object _) {},
+      );
+      await live.start();
+      _wakeWords = live;
+      unawaited(WakeWordService.resume());
+    } catch (_) {
+      // 模型没就绪、麦克风被别的应用占着：这一轮就不听，回到前台再算。
+    }
+  }
+
+  Future<void> _stopWakeListening() async {
+    final live = _wakeWords;
+    _wakeWords = null;
+    unawaited(WakeWordService.pause());
+    if (live == null) return;
+    try {
+      await live.stop();
+    } catch (_) {}
+  }
+
+  void _onWakeWords(String words) {
+    if (!words.contains(WakeWordService.defaultKeyword)) return;
+    if (_wakePending) return;
+    _wakePending = true;
+    unawaited(_stopWakeListening());
+    unawaited(WakeWordService.bringToFront());
   }
 
   @override
@@ -114,6 +165,10 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     WidgetsBinding.instance.removeObserver(this);
     super.dispose();
   }
+
+  /// 后台听唤醒词时那一轮本地识别；喊中或回到前台就收掉。
+  LiveWords? _wakeWords;
+  bool _wakePending = false;
 
   /// 跟随系统: the system language changed while the app was open.
   @override

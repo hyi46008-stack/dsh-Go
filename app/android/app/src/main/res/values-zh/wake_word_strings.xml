@@ -8,4 +8,5 @@
     <string name="wake_word_notification_stop">停止</string>
     <string name="wake_word_notification_no_permission">缺少麦克风权限</string>
     <string name="wake_word_notification_unavailable">这台手机没有可用的语音识别服务</string>
+    <string name="wake_word_notification_idle">后台待命，喊「小黄鱼」就醒</string>
 </resources>

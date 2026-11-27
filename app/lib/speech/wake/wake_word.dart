@@ -2,13 +2,11 @@ import 'dart:async';
 
 import 'package:flutter/services.dart';
 
-/// 小黄鱼语音唤醒：Dart 侧的开关与事件入口。
+/// 小黄鱼语音唤醒：Dart 侧的开关、事件与「喊中之后拉回前台」。
 ///
-/// 原生侧（voice/WakeWordService.kt）只在 App 退到后台时听唤醒词 —— 前台时麦克风要留给
-/// 输入框的听写和语音通话。喊中之后原生把 App 拉回前台，这里收到 `wake` 事件，
-/// 交给当前打开的对话去开始语音通话。
-///
-/// 通道：方法 `dsh/wake`（start/stop/pause/resume/status），事件 `dsh/wake/events`。
+/// 听和识别用的是应用自己的录音通道 + 本地语音模型（LiveWords），不走系统语音识别服务 ——
+/// 实测这台手机上系统识别服务在后台直接拒绝给本应用开麦（"caller doesn't have permission"）。
+/// 原生侧（voice/WakeWordService.kt）只负责让进程活着并挂一条通知。
 class WakeWordService {
   WakeWordService._();
 
@@ -19,47 +17,53 @@ class WakeWordService {
 
   static final List<bool Function(String heard)> _handlers = [];
   static StreamSubscription<dynamic>? _subscription;
-  static bool _listening = false;
   static bool _started = false;
 
-  /// 是否已经让原生开始听（不代表此刻一定在听：前台时会暂停）。
+  /// 是否已经让原生把前台服务挂起来。
   static bool get started => _started;
-  static bool get listening => _listening;
 
   /// 注册一个「唤醒之后干什么」的处理者；返回 true 表示这次唤醒有人接。
-  /// 多个界面同时注册时按注册顺序问，第一个接住为止。
   static void addHandler(bool Function(String heard) handler) => _handlers.add(handler);
 
   static void removeHandler(bool Function(String heard) handler) => _handlers.remove(handler);
 
-  /// 开始听唤醒词。App 启动时调一次即可；失败不抛给界面。
-  static Future<void> start({String keyword = defaultKeyword}) async {
+  /// 把唤醒事件交给当前打开的界面（只在 App 已经回到前台时调用）。
+  static void fireHandlers(String heard) {
+    for (final handler in [..._handlers]) {
+      try {
+        if (handler(heard)) break;
+      } catch (_) {
+        // 一个界面的处理出了错，不该影响别的界面接这次唤醒。
+      }
+    }
+  }
+
+  /// 挂起前台服务（不采集，只是让进程在后台活着并有通知）。
+  static Future<void> start() async {
     if (_started) return;
     try {
       await _listen();
       await _ensureMicrophone();
-      await _methods.invokeMethod<void>('start', {'keyword': keyword});
+      await _methods.invokeMethod<void>('start');
       _started = true;
     } catch (_) {
-      // 没有原生通道（电脑上的 DSH、或旧版 App）：静默跳过，面板会说明。
+      // 没有原生通道（电脑上的 DSH、旧版 App）：静默跳过，面板会说明。
     }
   }
 
   /// App 在前台：把麦克风让给听写与通话。
   static Future<void> pause() async {
     if (!_started) return;
-    _listening = false;
     try {
-      await _methods.invokeMethod<void>('pause');
+      await _methods.invokeMethod<void>('idle');
     } catch (_) {}
   }
 
-  /// App 退到后台：接着听。
+  /// App 退到后台：通知上写着在听。
   static Future<void> resume() async {
     if (!_started) return;
-    _listening = true;
     try {
-      await _methods.invokeMethod<void>('resume');
+      await _methods.invokeMethod<void>('listening');
     } catch (_) {}
   }
 
@@ -67,9 +71,15 @@ class WakeWordService {
   static Future<void> stop() async {
     if (!_started) return;
     _started = false;
-    _listening = false;
     try {
       await _methods.invokeMethod<void>('stop');
+    } catch (_) {}
+  }
+
+  /// 喊中之后把 App 拉回前台（原生侧 startActivity，targetSdk 28 允许后台启动）。
+  static Future<void> bringToFront() async {
+    try {
+      await _methods.invokeMethod<void>('bringToFront');
     } catch (_) {}
   }
 
@@ -87,21 +97,6 @@ class WakeWordService {
 
   static Future<void> _listen() async {
     if (_subscription != null) return;
-    _subscription = _events.receiveBroadcastStream().listen((dynamic event) {
-      if (event is! Map) return;
-      final type = event['type'];
-      if (type == 'wake') {
-        final heard = '${event['text'] ?? ''}';
-        for (final handler in [..._handlers]) {
-          try {
-            if (handler(heard)) break;
-          } catch (_) {
-            // 一个界面的处理出了错，不该影响别的界面接这次唤醒。
-          }
-        }
-      } else if (type == 'state') {
-        _listening = event['running'] == true;
-      }
-    }, onError: (Object _) {});
+    _subscription = _events.receiveBroadcastStream().listen((_) {}, onError: (Object _) {});
   }
 }
