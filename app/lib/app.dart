@@ -124,7 +124,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     if (_wakeWords != null) return;
     try {
       final chosen = await liveWordsModel(ref);
-      debugPrint('wake: model=${chosen?.model.name ?? 'none'}');
+      debugPrint('wake: model=${chosen == null ? 'none' : (chosen.model.isSystem ? 'system' : 'local')}');
       if (chosen == null) return;
       final live = LiveWords(
         ref.read(streamingPcmCaptureProvider),
