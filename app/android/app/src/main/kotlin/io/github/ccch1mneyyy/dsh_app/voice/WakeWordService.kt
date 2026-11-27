@@ -52,10 +52,7 @@ class WakeWordService : Service() {
                         addFlags(
                             Intent.FLAG_ACTIVITY_NEW_TASK or
                                 Intent.FLAG_ACTIVITY_CLEAR_TOP or
-                                Intent.FLAG_ACTIVITY_SINGLE_TOP or
-                                // 熄屏 / 锁屏时也把人叫回来：亮屏并盖在锁屏上面。
-                                Intent.FLAG_TURN_SCREEN_ON or
-                                Intent.FLAG_SHOW_WHEN_LOCKED,
+                                Intent.FLAG_ACTIVITY_SINGLE_TOP,
                         )
                         putExtra(MainActivity.EXTRA_WAKE, true)
                     },
