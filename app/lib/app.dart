@@ -124,6 +124,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
     if (_wakeWords != null) return;
     try {
       final chosen = await liveWordsModel(ref);
+      debugPrint('wake: model=${chosen?.model.name ?? 'none'}');
       if (chosen == null) return;
       final live = LiveWords(
         ref.read(streamingPcmCaptureProvider),
@@ -137,8 +138,10 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
       await live.start();
       _wakeWords = live;
       unawaited(WakeWordService.resume());
-    } catch (_) {
+      debugPrint('wake: listening');
+    } catch (error) {
       // 模型没就绪、麦克风被别的应用占着：这一轮就不听，回到前台再算。
+      debugPrint('wake: start failed $error');
     }
   }
 
@@ -153,6 +156,7 @@ class _DshAppState extends ConsumerState<DshApp> with WidgetsBindingObserver {
   }
 
   void _onWakeWords(String words) {
+    if (words.isNotEmpty) debugPrint('wake: heard "$words"');
     if (!words.contains(WakeWordService.defaultKeyword)) return;
     if (_wakePending) return;
     _wakePending = true;

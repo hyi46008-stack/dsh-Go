@@ -67,6 +67,25 @@ jobs:
           path: runtime/.cache
           key: ${{ steps.cache.outputs.cache-primary-key }}
 
+      - name: Restore the debug signing key
+        id: debugkey
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          # A freshly generated debug keystore per run makes every APK refuse to
+          # install over the previous one ("signatures do not match"). Keep one key.
+          path: ~/.android/debug.keystore
+          key: debug-keystore-v1
+
+      - name: Make a debug signing key if this is the first run
+        run: |
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            mkdir -p "$HOME/.android"
+            keytool -genkeypair -v -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -alias androiddebugkey -keypass android \
+              -keyalg RSA -keysize 2048 -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
       - uses: actions/setup-java@b843ebf9b913146b38da2eaa7aeddf76074ae1ad # v6.1.0
         with:
           distribution: temurin
@@ -146,6 +165,13 @@ jobs:
           } > "$RUNNER_TEMP/apk-identities.md"
           cat "$RUNNER_TEMP/apk-identities.md"
           sed -n '1,3p' SHA256SUMS
+
+      - name: Save the debug signing key
+        if: steps.debugkey.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.android/debug.keystore
+          key: ${{ steps.debugkey.outputs.cache-primary-key }}
 
       - name: Build report
         if: always()
