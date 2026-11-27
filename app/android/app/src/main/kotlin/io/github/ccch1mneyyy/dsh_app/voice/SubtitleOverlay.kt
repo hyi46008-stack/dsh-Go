@@ -52,7 +52,6 @@ object SubtitleOverlay {
                 // 先给一句占位字：wrap_content 的窗口要有内容才有高度，否则显示时会量成 0。
                 text = "小黄鱼在听…"
                 visibility = View.VISIBLE
-                alpha = 0f
             }
             val frame = FrameLayout(ctx).apply {
                 setPadding(dp(ctx, 18), 0, dp(ctx, 18), 0)
@@ -91,6 +90,7 @@ object SubtitleOverlay {
         view.text = text
         val frame = root ?: return@post
         Log.i("DshSubtitle", "show: " + text)
+        label?.alpha = 1f
         frame.animate().cancel()
         frame.translationY = dp(context, 26).toFloat()
         frame.animate().alpha(1f).translationY(0f).setDuration(220).start()
