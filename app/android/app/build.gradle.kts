@@ -141,6 +141,17 @@ android {
     }
 
     signingConfigs {
+        // A committed debug key, so every CI build of this fork signs with the same
+        // certificate: a per-run key makes each APK refuse to install over the last.
+        val forkKey = file("fork-debug.keystore")
+        if (forkKey.exists()) {
+            create("forkDebug") {
+                storeFile = forkKey
+                storePassword = "android"
+                keyAlias = "androiddebugkey"
+                keyPassword = "android"
+            }
+        }
         if (!keyProps.isEmpty) {
             create("release") {
                 storeFile = keyProps.getProperty("storeFile")?.let { file(it) }
@@ -161,6 +172,7 @@ android {
             // tooling/dev-run.sh installs debug over the release build on a phone, data
             // kept: Android only allows that with the same key.
             if (hasWholeReleaseKey) signingConfig = signingConfigs.getByName("release")
+            else if (file("fork-debug.keystore").exists()) signingConfig = signingConfigs.getByName("forkDebug")
         }
         release {
             // Use the release key when configured; local builds without key.properties fall back to debug.
