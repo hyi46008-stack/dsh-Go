@@ -22,13 +22,6 @@ on:
         options: [both, primary, side]
   push:
     branches: [ci/apk]
-    paths:
-      - '.github/workflows/android-apk.yml'
-      # App 代码一旦改动就出包：这样每次改 Kotlin / Dart 都能立刻拿到可装的 APK。
-      - 'app/**'
-      - 'packages/**'
-      - 'runtime/**'
-      - 'tooling/**'
 
 permissions:
   contents: write # 仅用于在 fork 里发布 ci-latest prerelease
